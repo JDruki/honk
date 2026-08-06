@@ -13,7 +13,7 @@ let
   manifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
 in
 rustPlatform.buildRustPackage {
-  pname = "honk";
+  pname = "honk-proxy";
   inherit (manifest.workspace.package) version;
 
   src = lib.cleanSource ../.;
@@ -46,10 +46,10 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   postInstall = ''
-    install -Dm444 config.min.dae "$out/share/doc/honk/config.min.dae"
-    install -Dm444 README.md "$out/share/doc/honk/README.md"
-    install -Dm444 README_CN.md "$out/share/doc/honk/README_CN.md"
-    install -Dm444 LICENSE "$out/share/licenses/honk/LICENSE"
+    install -Dm444 config.min.dae "$out/share/doc/honk-proxy/config.min.dae"
+    install -Dm444 README.md "$out/share/doc/honk-proxy/README.md"
+    install -Dm444 README_CN.md "$out/share/doc/honk-proxy/README_CN.md"
+    install -Dm444 LICENSE "$out/share/licenses/honk-proxy/LICENSE"
   '';
 
   meta = {

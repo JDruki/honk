@@ -52,7 +52,7 @@ build-all: build-core
 
 # Build the distributable eBPF-enabled package through the project flake.
 nix-build:
-    nix build .#honk
+    nix build .#honk-proxy
 
 # Enter the reproducible Rust + eBPF development environment.
 nix-develop:

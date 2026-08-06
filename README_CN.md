@@ -162,7 +162,7 @@ cargo run --release -p honk-core -- --config config.dae --mock-ebpf
 
 ```bash
 # 构建启用 eBPF 的引擎，并运行工具箱
-nix build .#honk
+nix build .#honk-proxy
 nix run .#honk-tool -- --help
 
 # 可复现的开发环境（用户态 stable Rust + eBPF nightly Rust）
@@ -170,22 +170,23 @@ nix develop
 just build-core
 ```
 
-在 NixOS 中导入 `inputs.honk.nixosModules.default`，并在
-`services.honk.configFile`（含密钥时推荐）和 `services.honk.config` 中二选一：
+在 NixOS 中导入 `inputs.honk.nixosModules."honk-proxy"`，并在
+`services."honk-proxy".configFile`（含密钥时推荐）和
+`services."honk-proxy".config` 中二选一：
 
 ```nix
 {
-  services.honk = {
+  services."honk-proxy" = {
     enable = true;
-    configFile = "/run/secrets/honk/config.dae";
+    configFile = "/run/secrets/honk-proxy/config.dae";
   };
 }
 ```
 
 服务以 root 运行，因为它需要管理网络命名空间、TC hook 与 eBPF map。它会设置
-无限 memlock 限制，并支持通过 `systemctl reload honk` 走守护进程的 SIGHUP 热重载。
-通过 `services.honk.assetsPath` 设置 `geoip.dat` / `geosite.dat` 目录；只有在需要
-让宿主机防火墙放行透明代理端口时才启用 `services.honk.openFirewall`。
+无限 memlock 限制，并支持通过 `systemctl reload honk-proxy` 走守护进程的 SIGHUP 热重载。
+通过 `services."honk-proxy".assetsPath` 设置 `geoip.dat` / `geosite.dat` 目录；只有在需要
+让宿主机防火墙放行透明代理端口时才启用 `services."honk-proxy".openFirewall`。
 
 ### Docker
 

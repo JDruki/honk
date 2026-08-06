@@ -17,24 +17,24 @@ let
     types
     ;
 
-  cfg = config.services.honk;
-  configPath = if cfg.configFile != null then cfg.configFile else "/etc/honk/config.dae";
+  cfg = config.services."honk-proxy";
+  configPath = if cfg.configFile != null then cfg.configFile else "/etc/honk-proxy/config.dae";
 in
 {
-  options.services.honk = {
-    enable = mkEnableOption "honk, a Rust eBPF transparent proxy engine";
+  options.services."honk-proxy" = {
+    enable = mkEnableOption "honk-proxy, a Rust eBPF transparent proxy engine";
 
     package = mkOption {
       type = types.package;
       default = packageFor pkgs;
-      defaultText = lib.literalExpression "inputs.honk.packages.\${pkgs.system}.honk";
-      description = "The honk package to run.";
+      defaultText = lib.literalExpression "inputs.honk.packages.\${pkgs.system}.\"honk-proxy\"";
+      description = "The honk-proxy package to run.";
     };
 
     configFile = mkOption {
       type = types.nullOr (types.addCheck types.str (path: hasPrefix "/" path));
       default = null;
-      example = "/run/secrets/honk/config.dae";
+      example = "/run/secrets/honk-proxy/config.dae";
       description = ''
         Absolute runtime path to the dae-format configuration. Use this for
         configurations containing credentials or managed outside Nix.
@@ -45,7 +45,7 @@ in
       type = types.nullOr types.lines;
       default = null;
       description = ''
-        dae-format configuration written to /etc/honk/config.dae. This value
+        dae-format configuration written to /etc/honk-proxy/config.dae. This value
         is stored in the world-readable Nix store; do not put secrets here.
       '';
     };
@@ -67,7 +67,7 @@ in
     assetsPath = mkOption {
       type = types.nullOr types.str;
       default = null;
-      example = "/var/lib/honk/assets";
+      example = "/var/lib/honk-proxy/assets";
       description = ''
         Directory containing geoip.dat and geosite.dat. When set, this is
         passed as DAE_LOCATION_ASSET, matching honk's geo-asset lookup.
@@ -91,7 +91,7 @@ in
 
     stateDirectory = mkOption {
       type = types.str;
-      default = "honk";
+      default = "honk-proxy";
       description = ''
         Name of the systemd StateDirectory created below /var/lib. Point
         cache_file.path in the honk configuration here when persistence is
@@ -104,12 +104,12 @@ in
     assertions = [
       {
         assertion = (cfg.config == null) != (cfg.configFile == null);
-        message = "services.honk: set exactly one of config or configFile.";
+        message = "services.honk-proxy: set exactly one of config or configFile.";
       }
     ];
 
-    environment.etc."honk/config.dae" = mkIf (cfg.configFile == null) {
-      source = pkgs.writeText "honk-config.dae" (if cfg.config == null then "" else cfg.config);
+    environment.etc."honk-proxy/config.dae" = mkIf (cfg.configFile == null) {
+      source = pkgs.writeText "honk-proxy-config.dae" (if cfg.config == null then "" else cfg.config);
       mode = "0600";
     };
 
@@ -118,14 +118,13 @@ in
       allowedUDPPorts = [ cfg.openFirewall.port ];
     };
 
-    systemd.services.honk = {
-      description = "honk transparent proxy engine";
+    systemd.services."honk-proxy" = {
+      description = "honk-proxy transparent proxy engine";
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       reloadTriggers =
-        optional (cfg.config != null) cfg.config
-        ++ optional (cfg.configFile != null) cfg.configFile;
+        optional (cfg.config != null) cfg.config ++ optional (cfg.configFile != null) cfg.configFile;
 
       serviceConfig = {
         ExecStart = "${getExe cfg.package} --config ${lib.escapeShellArg configPath} ${lib.escapeShellArgs cfg.extraArgs}";

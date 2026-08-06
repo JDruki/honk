@@ -131,7 +131,7 @@ the eBPF object with the pinned nightly toolchain, embeds that object in the
 
 ```bash
 # Build the eBPF-enabled engine and run the toolbox
-nix build .#honk
+nix build .#honk-proxy
 nix run .#honk-tool -- --help
 
 # Reproducible development environment (stable userspace Rust + nightly eBPF Rust)
@@ -139,23 +139,23 @@ nix develop
 just build-core
 ```
 
-For NixOS, import `inputs.honk.nixosModules.default` and configure exactly one
-of `services.honk.configFile` (recommended for secrets) or
-`services.honk.config`:
+For NixOS, import `inputs.honk.nixosModules."honk-proxy"` and configure exactly one
+of `services."honk-proxy".configFile` (recommended for secrets) or
+`services."honk-proxy".config`:
 
 ```nix
 {
-  services.honk = {
+  services."honk-proxy" = {
     enable = true;
-    configFile = "/run/secrets/honk/config.dae";
+    configFile = "/run/secrets/honk-proxy/config.dae";
   };
 }
 ```
 
 The service runs as root because it manages network namespaces, TC hooks, and
 eBPF maps. It sets an unlimited memlock limit and supports `systemctl reload
-honk` for the daemon's SIGHUP reload path. Set `services.honk.assetsPath` for
-`geoip.dat` / `geosite.dat`, and use `services.honk.openFirewall` only when the
+honk-proxy` for the daemon's SIGHUP reload path. Set `services."honk-proxy".assetsPath` for
+`geoip.dat` / `geosite.dat`, and use `services."honk-proxy".openFirewall` only when the
 transparent-proxy port must be reachable through the host firewall.
 
 ### Docker

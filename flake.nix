@@ -73,7 +73,7 @@
             rustToolchain = rustEbpf;
             bpf-linker = bpfLinker;
           };
-          honk = pkgs'.callPackage ./nix/package.nix {
+          honkProxy = pkgs'.callPackage ./nix/package.nix {
             inherit rustPlatform;
             honkEbpfObject = honkEbpf;
           };
@@ -83,29 +83,39 @@
         in
         {
           packages = {
-            default = honk;
-            inherit honk honkEbpf honkTool;
+            default = honkProxy;
+            "honk-proxy" = honkProxy;
+            "honk-ebpf" = honkEbpf;
+            "honk-tool" = honkTool;
           };
 
           apps = {
             default = {
               type = "app";
-              program = "${honk}/bin/honk-core";
+              program = "${honkProxy}/bin/honk-core";
             };
-            honk-tool = {
+            "honk-proxy" = {
+              type = "app";
+              program = "${honkProxy}/bin/honk-core";
+            };
+            "honk-tool" = {
               type = "app";
               program = "${honkTool}/bin/honk-tool";
             };
           };
 
-          # easyOverlay turns these into overlays.default, so downstream NixOS
-          # configurations can use pkgs.honk and pkgs.honkTool as well.
+          # easyOverlay turns these into overlays.default without colliding
+          # with nixpkgs' unrelated Honk microblog package.
           overlayAttrs = {
-            inherit honk honkEbpf honkTool;
+            "honk-proxy" = honkProxy;
+            "honk-ebpf" = honkEbpf;
+            "honk-tool" = honkTool;
           };
 
           checks = {
-            inherit honk honkEbpf honkTool;
+            "honk-proxy" = honkProxy;
+            "honk-ebpf" = honkEbpf;
+            "honk-tool" = honkTool;
           };
 
           devShells.default = pkgs'.mkShell {
@@ -139,8 +149,15 @@
           formatter = pkgs'.nixfmt-rfc-style;
         };
 
-      flake.nixosModules.default = import ./nix/module.nix {
-        packageFor = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.honk;
-      };
+      flake.nixosModules =
+        let
+          module = import ./nix/module.nix {
+            packageFor = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}."honk-proxy";
+          };
+        in
+        {
+          default = module;
+          "honk-proxy" = module;
+        };
     };
 }
