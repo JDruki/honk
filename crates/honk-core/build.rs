@@ -15,6 +15,10 @@ fn embed_ebpf_object() {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    println!("cargo:rerun-if-env-changed=HONK_EBPF_OBJECT");
+    println!("cargo:rerun-if-env-changed=HONK_EBPF_CARGO");
+    println!("cargo:rerun-if-env-changed=HONK_EBPF_RUSTC");
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ebpf_crate = manifest_dir.join("../honk-ebpf");
     let ebpf_common_crate = manifest_dir.join("../honk-ebpf-common");
@@ -66,6 +70,38 @@ fn embed_ebpf_object() {
             .any(|src_mtime| src_mtime > obj_mtime)
     }
 
+    // Packaging systems can build the standalone eBPF crate separately and
+    // pass its immutable output here. This avoids having the userspace crate
+    // invoke rustup (and, transitively, download a nightly toolchain) inside
+    // a sandboxed build. It is also useful to distributors that package the
+    // object and binary independently.
+    if let Some(obj) = std::env::var_os("HONK_EBPF_OBJECT").map(PathBuf::from) {
+        if !obj.is_file() {
+            panic!(
+                "HONK_EBPF_OBJECT points to a missing file: {}",
+                obj.display()
+            );
+        }
+        if !object_has_btf(&obj) {
+            panic!(
+                "HONK_EBPF_OBJECT at {} has no .BTF section — aya cannot load it",
+                obj.display()
+            );
+        }
+
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+        let dest = out_dir.join("honk-ebpf.o");
+        std::fs::copy(&obj, &dest)
+            .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", obj.display(), dest.display()));
+        println!("cargo:rerun-if-changed={}", obj.display());
+        println!("cargo:rustc-env=HONK_EBPF_OBJECT={}", dest.display());
+        println!(
+            "cargo:warning=external eBPF object embedded ({} bytes)",
+            obj.metadata().map(|m| m.len()).unwrap_or(0)
+        );
+        return;
+    }
+
     let candidates = [
         ebpf_target.clone(),
         manifest_dir.join("../../target/honk-core.o"),
@@ -98,15 +134,33 @@ fn embed_ebpf_object() {
             // Missing, or stale without .BTF (e.g. built while an environment
             // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
             println!("cargo:warning=Building eBPF object (one-time, ~30s)...");
-            let status = Command::new("cargo")
-                .args([
+            let ebpf_cargo = std::env::var_os("HONK_EBPF_CARGO");
+            let cargo = ebpf_cargo
+                .as_deref()
+                .unwrap_or_else(|| std::ffi::OsStr::new("cargo"));
+            let mut command = Command::new(cargo);
+            if ebpf_cargo.is_some() {
+                command.args([
+                    "build",
+                    "--release",
+                    "-Zbuild-std=core",
+                    "--target",
+                    "bpfel-unknown-none",
+                ]);
+            } else {
+                command.args([
                     "+nightly",
                     "build",
                     "--release",
                     "-Zbuild-std=core",
                     "--target",
                     "bpfel-unknown-none",
-                ])
+                ]);
+            }
+            if let Some(rustc) = std::env::var_os("HONK_EBPF_RUSTC") {
+                command.env("RUSTC", rustc);
+            }
+            let status = command
                 // An inherited RUSTFLAGS would override the crate's
                 // .cargo/config.toml rustflags (--btf, debuginfo) and silently
                 // produce a BTF-less object again.

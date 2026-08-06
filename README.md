@@ -123,6 +123,41 @@ cargo run --release -p honk-core -- --config config.dae --mock-ebpf
 
 Day-to-day tasks: see `Justfile` (`just build-core`, `just run`, `just clean-all`, …).
 
+### Nix
+
+The repository ships a flake for `x86_64-linux` and `aarch64-linux`. It builds
+the eBPF object with the pinned nightly toolchain, embeds that object in the
+`honk-core` package, and exposes a NixOS module.
+
+```bash
+# Build the eBPF-enabled engine and run the toolbox
+nix build .#honk
+nix run .#honk-tool -- --help
+
+# Reproducible development environment (stable userspace Rust + nightly eBPF Rust)
+nix develop
+just build-core
+```
+
+For NixOS, import `inputs.honk.nixosModules.default` and configure exactly one
+of `services.honk.configFile` (recommended for secrets) or
+`services.honk.config`:
+
+```nix
+{
+  services.honk = {
+    enable = true;
+    configFile = "/run/secrets/honk/config.dae";
+  };
+}
+```
+
+The service runs as root because it manages network namespaces, TC hooks, and
+eBPF maps. It sets an unlimited memlock limit and supports `systemctl reload
+honk` for the daemon's SIGHUP reload path. Set `services.honk.assetsPath` for
+`geoip.dat` / `geosite.dat`, and use `services.honk.openFirewall` only when the
+transparent-proxy port must be reachable through the host firewall.
+
 ### Docker
 
 Default image builds `honk-core` without the `ebpf` feature (mock backend). For real eBPF, build with `--features ebpf` (nightly + bpf-linker in the build stage) or pass `--bpf-object`.

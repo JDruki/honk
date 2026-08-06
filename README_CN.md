@@ -155,6 +155,38 @@ cargo run --release -p honk-core -- --config config.dae --mock-ebpf
 
 日常任务见 `Justfile`（`just build-core`、`just run`、`just clean-all` 等）。
 
+### Nix
+
+仓库提供 `x86_64-linux` 与 `aarch64-linux` 的 flake。它会用固定的 nightly
+构建 eBPF 对象，将其嵌入 `honk-core` 软件包，并导出 NixOS module。
+
+```bash
+# 构建启用 eBPF 的引擎，并运行工具箱
+nix build .#honk
+nix run .#honk-tool -- --help
+
+# 可复现的开发环境（用户态 stable Rust + eBPF nightly Rust）
+nix develop
+just build-core
+```
+
+在 NixOS 中导入 `inputs.honk.nixosModules.default`，并在
+`services.honk.configFile`（含密钥时推荐）和 `services.honk.config` 中二选一：
+
+```nix
+{
+  services.honk = {
+    enable = true;
+    configFile = "/run/secrets/honk/config.dae";
+  };
+}
+```
+
+服务以 root 运行，因为它需要管理网络命名空间、TC hook 与 eBPF map。它会设置
+无限 memlock 限制，并支持通过 `systemctl reload honk` 走守护进程的 SIGHUP 热重载。
+通过 `services.honk.assetsPath` 设置 `geoip.dat` / `geosite.dat` 目录；只有在需要
+让宿主机防火墙放行透明代理端口时才启用 `services.honk.openFirewall`。
+
 ### Docker
 
 默认镜像构建不含 `ebpf` feature（mock 后端）。真实 eBPF 需在构建阶段加 `--features ebpf`（nightly + bpf-linker），或运行时传 `--bpf-object`。

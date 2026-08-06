@@ -50,6 +50,18 @@ build-ebpf:
 # Build all (core with embedded ebpf)
 build-all: build-core
 
+# Build the distributable eBPF-enabled package through the project flake.
+nix-build:
+    nix build .#honk
+
+# Enter the reproducible Rust + eBPF development environment.
+nix-develop:
+    nix develop
+
+# Evaluate all flake outputs and build package checks.
+nix-check:
+    nix flake check
+
 # ── Check ────────────────────────────────────────────────
 
 # Fast compile check
