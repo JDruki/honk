@@ -20,6 +20,9 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
+    outputHashes = {
+      "boring-sys-5.1.0" = "sha256-CjKtJNqfv7codFiIzushlAQDy/iVqe2EChWRZamsCLQ=";
+    };
   };
 
   nativeBuildInputs = [
