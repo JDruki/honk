@@ -42,6 +42,7 @@ log/
 # Local artifacts
 cache.db
 sing-box/
+.sub/
 
 honk/
 
@@ -58,3 +59,7 @@ yacd/
 AGENTS.md
 
 docs
+.zed
+results
+.sisyphus
+.expect

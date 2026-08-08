@@ -64,7 +64,7 @@ pub struct LpmKeepSet {
 /// chunk boundary (used to enforce the janitor time budget).
 pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) -> bool + 'a;
 pub type RedirectTrackChunkVisitor<'a> = dyn FnMut(&[(RedirectTuple, RedirectEntry)]) -> bool + 'a;
-pub type CookiePidChunkVisitor<'a> = dyn FnMut(&[(u64, PidPname)]) -> bool + 'a;
+pub type CookiePidChunkVisitor<'a> = dyn FnMut(&[(u64, PIDName)]) -> bool + 'a;
 pub type RoutingHandoffChunkVisitor<'a> =
     dyn FnMut(&[(TuplesKey, RoutingHandoffEntry)]) -> bool + 'a;
 
@@ -106,12 +106,15 @@ impl DomainRouteWriteError {
 pub enum IfaceRole {
     Lan,
     Wan,
+    /// LAN and WAN resolve to the same interface. The startup datapath uses
+    /// LAN ingress plus WAN egress, not the LAN egress/WAN ingress pair.
+    LanWan,
     /// Slave port of a configured LAN bridge master: forwarded L2 traffic
     /// never crosses the master's TC hooks, so the LAN programs go on each
     /// slave (mirrors the startup expansion).
     LanBridgeSlave,
-    /// Slave of a configured LAN bond master: packets may arrive/leave on
-    /// the slave without touching the master's qdiscs, so it gets
+    /// Slave of a configured LAN bond master: packets may arrive/leave on the
+    /// slave without touching the master's qdiscs, so it gets
     /// lan_ingress + wan_egress (mirrors the startup expansion).
     LanBondSlave,
     /// Slave of a WAN bond master: locally-originated traffic can bypass the
@@ -444,8 +447,8 @@ pub trait EbpfBackend: Send + Sync {
     /// `cleanup()`, which takes the write lock.
     fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>>;
 
-    fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PidPname>>;
-    fn cookie_pid_store(&mut self, cookie: u64, entry: &PidPname) -> anyhow::Result<()>;
+    fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;
+    fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()>;
     fn cookie_pid_remove(&mut self, cookie: &u64) -> anyhow::Result<()>;
 
     fn set_outbound_alive(
@@ -506,7 +509,7 @@ pub trait EbpfBackend: Send + Sync {
         &self,
         out: &mut Vec<(RedirectTuple, RedirectEntry)>,
     ) -> anyhow::Result<()>;
-    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()>;
+    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PIDName)>) -> anyhow::Result<()>;
     fn routing_handoff_snapshot(
         &self,
         out: &mut Vec<(TuplesKey, RoutingHandoffEntry)>,
@@ -577,7 +580,7 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<u64>;
     fn cookie_pid_remove_if_unchanged(
         &mut self,
-        entries: &[(u64, PidPname)],
+        entries: &[(u64, PIDName)],
         expired_before_ns: u64,
     ) -> anyhow::Result<u64>;
     fn routing_handoff_remove_if_unchanged(

@@ -20,15 +20,15 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `log_level` | `log_level` | `"info"` | `trace`/`debug`/`info`/`warn`/`error` |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Skip waiting for network readiness |
 | `lan_interface` | `lan_interface` | `[]` | LAN ifaces to intercept (comma-separated); empty installs no LAN hooks |
-| `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP; `auto` allowed |
+| `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP. `auto` follows the IPv4 default route; while none exists it stays pending (never falls back to `lo`) and attaches on link/address/route events. The same event republishes generated gateway-address `direct(must)` rules and immediately re-probes health-backed outbounds. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Auto sysctl (root) |
+| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `<working-directory>/.sub` for network-independent startup/reload recovery. Changing it requires a process restart. |
 | `tcp_check_url` | `tcp_check_url` | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP health targets (comma-separated) |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method for URL checks |
 | `udp_check_dns` | `udp_check_dns` | dns.google / 8.8.8.8 / IPv6 | UDP health DNS targets (comma-separated) |
 | `check_interval` | `check_interval_secs` | `30` | Health interval, duration form (e.g. `30s`) |
 | `check_tolerance` | `check_tolerance_ms` | `50` | URLTest switch delta, duration form (e.g. `50ms`) |
 | `dial_mode` | `dial_mode` | `"domain"` | `ip` / `domain` / `domain+` / `domain++` |
-| `lan_tcp_mss` | `lan_tcp_mss` | `0` | Deprecated; parsed only |
 | `allow_insecure` | `allow_insecure` | `false` | Global TLS skip-verify fallback |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30` | Sniff timeout, duration form (e.g. `30ms`) |
 | `tls_implementation` | `tls_implementation` | `"tls"` | TLS stack: `tls` (plain BoringSSL) / `utls` (real Chrome fingerprint) |
@@ -149,7 +149,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `ss` | `shadowsocks` | Yes | Yes | AEAD + `2022-blake3-*` |
 | `trojan` | | Yes | Yes | TLS; WS/gRPC via transport |
 | `vmess` | | Yes | No | AEAD; WS/gRPC; REALITY via `security=reality`; registered only with the `rprx` feature (on in honk-core's default build) |
-| `vless` | | Yes | No | REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; header UDP exists in tests only; registered only with the `rprx` feature |
+| `vless` | | Yes | No | REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; registered only with the `rprx` feature |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
@@ -179,6 +179,13 @@ node {
 ```
 
 Verified VLESS combinations (live interop against a sing-box 1.13 server): TCP+REALITY+vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, TCP+gRPC. The `xtls-rprx-vision` flow only combines with TCP+REALITY/TLS — over WS/gRPC there is no raw socket for the XTLS direct-copy switch, matching upstream.
+
+Clash subscriptions map VLESS `uuid`, `servername`/`sni`, `flow`, `network`,
+nested `reality-opts`, `ws-opts`, and `grpc-opts` into the same node fields
+before identity derivation. Incomplete `reality-opts` entries are skipped.
+Feed shapes outside TCP/WS/gRPC, non-Vision flows, Vision without TLS/REALITY,
+and Vision over WS/gRPC are reported by `honk-tool sub` but not probed.
+`client-fingerprint` is not a node field; the global TLS mode owns it.
 
 **VLESS + REALITY (xtls-rprx-vision)**
 
@@ -273,6 +280,7 @@ group {
 | (section name) | `name` | **required** | Outbound tag in routing |
 | `policy` | `policy` | `selector` | Selection policy |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | Node filters; resolved to members |
+| `filter: subtag(...)` | `filters` + `nodes` | `[]` | Subscription provenance filter; exact/`keyword:`/`regex:` tag matching |
 | `filter: group('tag', ...)` | `groups` | `[]` | Nested sub-group tags (`'a', 'b'` or `'a\|b'` forms) |
 | `default` | `default` | null | Selector default member tag |
 | `final` | `final_outbound` | null | When all members are dead |
@@ -297,9 +305,10 @@ group {
 ### Filter resolution
 
 1. `filter: group('tag')` → nested tags (`groups`), not node list.
-2. `filter: name(...)` filters OR-match into members.
-3. No filters and no nested groups → **all nodes**.
-4. Nested groups only → **not** all nodes.
+2. `name(...)` matches node names; `subtag(...)` matches the tag of the subscription that produced a node. Both accept exact, `keyword:`, and `regex:` arguments and are case-sensitive.
+3. Predicates joined with `&&` on one line are AND-ed and support `!` negation; separate `filter:` lines are OR-ed.
+4. Filter-derived node membership is rebuilt after subscription refresh, so stable node IDs cannot retain membership after moving between subscriptions.
+5. No filters and no nested groups → **all nodes**; nested groups only → **not** all nodes.
 
 ### Nested groups
 
@@ -309,7 +318,7 @@ Depth capped at 8; cycles cut at construction with a warning. Dial always resolv
 
 ## 4. Routing (`routing { ... }`)
 
-Rules are condition functions joined with `&&`, followed by `-> outbound` (optionally `outbound(must)`), in match order, ending with a `fallback:`:
+Rules are condition functions joined with `&&`, followed by `-> outbound` (optionally `outbound(must)`), in match order, ending with a `fallback:`. Parenthesized matcher arguments may span physical lines without splitting the rule:
 
 ```dae
 routing {
@@ -317,7 +326,9 @@ routing {
     domain(suffix: example.com, geosite: cn) -> proxy
     domain(keyword: m-team) -> direct
     dip(geoip: cn) -> direct(must)
-    sip(10.10.10.24/32) -> direct
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
     dport(22, 80, 443, 8080) -> proxy
     fallback: direct
 }
@@ -337,7 +348,7 @@ domain/geosite matchers, so it never vetoes them.
 | ------- | ------ | --------- | --------- |
 | `name` | string | auto `rule-N` | Display name |
 | condition fields | flattened | | See below |
-| `outbound` | string / complex | required | Target (dae syntax: the `->` right-hand side) |
+| `outbound` | string | required | One node/group tag (the `->` right-hand side in dae syntax) |
 | `priority` | u32 | rule order | Lower = higher priority (dae: line order) |
 | `must` | bool | `false` | Non-final must-rule (`-> direct(must)`) |
 | `mark` | u32 | `0` | fwmark; `0` = none; not settable in dae syntax |
@@ -377,10 +388,6 @@ Multiple functions on one rule are AND'd with `&&`.
 | `mac` / `dscp` / `ipversion` | same |
 
 `domain` arg tags: bare/`suffix:` → suffix; `keyword:`; `full:`; `regex:`; `geosite:` (verbatim; `category@attr` filters entries by attribute key, dae semantics — case-insensitive, everything after the first `@` is the selector; zero-match expansion warns and never matches). `dip` args: plain CIDRs or `geoip: code`.
-
-### Complex outbound (not in dae syntax)
-
-A parsed shape `{ type = "or"|"and"|"balancer"|"chain", outbounds = [...] }` exists in the internal schema; **balancer/chain are not fully wired** like simple string outbounds, and dae syntax only writes a plain outbound name after `->`. Prefer group policies.
 
 ---
 
@@ -517,7 +524,16 @@ In dae syntax only `name` (the tag) and `url` are settable; the rest is runtime 
 | `node_count` | u32 | `0` | Last count |
 | `created_at` | datetime | now | Created |
 
-Nodes are memory-only; periodic refresh merges via control plane.
+Nodes remain runtime-only and are never written into the config file. With
+`global { store_subscribe: true }` (the default), each successfully fetched and
+parsed raw body is atomically stored under `<working-directory>/.sub`; the
+directory is mode `0700`, files are mode `0600`, and filenames are hashes of
+the URL plus request identity. Startup restores valid bodies before network
+refresh. A restored subscription does not consume the five-second first-fetch
+grace period, but its online refresh still runs in the background. Reload
+first carries active nodes and uses the stored body for any enabled subscription
+without carried nodes. Fetch, parse, or store failure keeps both the active
+nodes and the last valid stored body.
 
 ---
 
@@ -560,7 +576,7 @@ experimental {
 | GET/PUT | `/proxies/{name}` | Detail / selector set |
 | GET | `/proxies/{name}/delay` | On-demand delay |
 | GET | `/group/{name}/delay` | Group delay |
-| GET | `/rules` | Rules |
+| GET | `/rules` | One row per rule: native Clash type for simple matchers; `complex` + full statement for compound, negated, or `must` dae rules |
 | GET/DELETE | `/connections` | List / close all |
 | DELETE | `/connections/{id}` | Close one |
 | GET | `/traffic` | WS or chunked JSON lines |
@@ -681,7 +697,8 @@ Configured via `global { ... }` keys (`tcp_check_url`, `udp_check_dns`, `check_i
 | UDP probe | DNS to first usable `udp_check_dns` via node `dial_udp_transport` |
 | Per-group check URL | Groups with `check_url` probe members against it (sub-group members via their current pick, keyed by tag — sing-box RealTag); (tag, url) state independent of the global one — dead-for-this-URL excludes the member from that group only |
 | Concurrency | Default batch 10 |
-| Recovery | 2 consecutive successes |
+| Recovery | 2 consecutive successes; a relevant link/address/route change clears stale cooldown and lets the next successful probe verify recovery |
+| Dead-node retry | Due dead TCP/UDP families are reconsidered every `min(5s, check_interval)`; actual probes still honor the 5s→300s exponential backoff |
 | Deep backoff | After 10 consecutive failures, probing continues at the max-cooldown (300s) cadence — no permanent stop |
 | Dial failure | Latency history cleared + one synthetic 10s penalty sample (sing-box `DeleteURLTestHistory` + flap guard); a node's pooled connections and UDP endpoints are purged when it flips alive→dead |
 | UDP driver failure | Transport send/receive/reply-idle errors report a DataUdp traffic failure; intentional endpoint retirement and shutdown are health-neutral |

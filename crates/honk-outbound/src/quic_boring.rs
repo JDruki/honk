@@ -55,8 +55,6 @@ const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
 
 // BoringSSL encryption levels (ssl.h ssl_encryption_level_t).
 const LEVEL_INITIAL: usize = 0;
-#[allow(dead_code)] // BoringSSL level 1 (0-RTT); unused, honk offers no early data
-const LEVEL_EARLY_DATA: usize = 1;
 const LEVEL_HANDSHAKE: usize = 2;
 const LEVEL_APPLICATION: usize = 3;
 
@@ -452,10 +450,6 @@ static QUIC_METHOD: boring_sys::SSL_QUIC_METHOD = boring_sys::SSL_QUIC_METHOD {
     send_alert: Some(on_send_alert),
 };
 
-/// Process-wide client ticket cache: hostname → SSL_SESSION. TLS 1.3
-/// resumption in BoringSSL is explicit (`SSL_set_session` before the
-/// handshake) — the internal SSL_CTX cache only serves TLS 1.2-style id
-/// lookups, so tickets are stashed here keyed by server name.
 /// Process-wide client ticket cache: key → SSL_SESSION, bounded and
 /// insertion-ordered (oldest evicted past [`SESSION_TICKETS_CAP`]).
 /// TLS 1.3 resumption in BoringSSL is explicit (`SSL_set_session` before the

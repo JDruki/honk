@@ -22,15 +22,15 @@
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error` |
 | `disable_waiting_network` | bool | `false` | 启动时不等待网络就绪 |
 | `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空时不安装任何 LAN hook；逗号分隔 |
-| `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；支持 `auto`；逗号分隔 |
+| `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；`auto` 跟随 IPv4 默认路由。默认路由不存在时保持待定（不会回退到 `lo`），并在网卡、地址或路由事件后自动挂载；同一事件还会重新发布网关本机地址的 `direct(must)` 规则，并立即复测受健康状态控制的出站。 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
+| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `<运行目录>/.sub`，供启动/重载在网络不可用时恢复；修改后需重启进程。 |
 | `tcp_check_url` | string[] | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP 健康检查目标；逗号分隔 |
 | `tcp_check_http_method` | string | `"HEAD"` | URL 检查的 HTTP 方法 |
 | `udp_check_dns` | string[] | dns.google / 8.8.8.8 / IPv6 | UDP 健康检查 DNS 目标；逗号分隔 |
 | `check_interval_secs` | u64 | `30` | 检查间隔（秒）。**dae：** `check_interval` 时长（如 `300s`） |
 | `check_tolerance_ms` | u64 | `50` | URLTest 切换阈值（ms）。**dae：** `check_tolerance`（如 `30ms`） |
 | `dial_mode` | string | `"domain"` | `ip` / `domain` / `domain+` / `domain++` |
-| `lan_tcp_mss` | u16 | `0` | 已弃用；仅解析兼容 |
 | `allow_insecure` | bool | `false` | 全局 TLS 跳过校验回退 |
 | `sniffing_timeout_ms` | u64 | `30` | 嗅探超时（ms）。**dae：** `sniffing_timeout` 时长 |
 | `tls_implementation` | string | `"tls"` | TLS 栈：`tls`（原生 BoringSSL）/ `utls`（真实 Chrome 指纹） |
@@ -119,7 +119,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `ss` | `shadowsocks` | 是 | 是 | AEAD + `2022-blake3-*` |
 | `trojan` | | 是 | 是 | TLS；经 transport 支持 WS/gRPC |
 | `vmess` | | 是 | 否 | AEAD；WS/gRPC；`security=reality` 可启用 REALITY；仅在 `rprx` feature 下注册（honk-core 默认构建开启） |
-| `vless` | | 是 | 否 | REALITY + `xtls-rprx-vision` flow；经 transport 支持 WS/gRPC；头里的 UDP 仅测试存在；仅在 `rprx` feature 下注册 |
+| `vless` | | 是 | 否 | REALITY + `xtls-rprx-vision` flow；经 transport 支持 WS/gRPC；仅在 `rprx` feature 下注册 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
@@ -149,6 +149,14 @@ node {
 ```
 
 已实测互通的 VLESS 组合（对 sing-box 1.13 服务端）：TCP+REALITY+vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC。`xtls-rprx-vision` flow 仅与 TCP+REALITY/TLS 组合——WS/gRPC 下没有可供 XTLS direct-copy 切换的裸连接，与上游一致。
+
+Clash 订阅会在派生节点身份前把 VLESS 的 `uuid`、`servername`/`sni`、
+`flow`、`network` 以及嵌套 `reality-opts`、`ws-opts`、`grpc-opts` 映射到
+同一组节点字段；不完整的 `reality-opts` 条目直接跳过。TCP/WS/gRPC
+以外的传输、非 Vision flow、缺少 TLS/REALITY 的 Vision，以及经
+WS/gRPC 的 Vision 会由 `honk-tool sub` 显示但不探测。
+`client-fingerprint` 不是节点字段，由全局 TLS 模式统一控制。
+
 **VLESS + REALITY（xtls-rprx-vision）**
 
 `security=reality` 把 vless（或 vmess）节点从普通 TLS 切换为 REALITY 握手；`pbk`/`sid`/`spx` 携带 REALITY 参数，`flow=xtls-rprx-vision` 启用 XTLS Vision 拼接：
@@ -236,7 +244,7 @@ group {
 | `name` | string | **必填** | 路由中的出站标签；dae 中为子节名 |
 | `policy` | enum | `selector` | 选择策略 |
 | `nodes` | UUID[] | `[]` | 通常由 filters 填充 |
-| `filters` | string[] | `[]` | `name(...)` / `group(...)`；dae 中每条一个 `filter:` 行 |
+| `filters` | string[] | `[]` | `name(...)` / `subtag(...)` / `group(...)`；dae 中每条一个 `filter:` 行 |
 | `groups` | string[] | `[]` | 嵌套组标签；`filter: group('a', 'b')`，也接受 `'a\|b'` / `'a, b'` |
 | `default` | string? | null | Selector 默认节点名 |
 | `final_outbound` | string? | null | 全死时出站。**dae：** `final` |
@@ -260,9 +268,10 @@ group {
 ### 过滤解析
 
 1. `group('tag')` → 嵌套标签（`groups`），不进节点列表。
-2. `name(...)` 过滤以 OR 方式匹配成员。
-3. 无 filters 且无嵌套组 → **全部节点**。
-4. 仅有嵌套组 → **不是**全部节点。
+2. `name(...)` 匹配节点名；`subtag(...)` 匹配产生该节点的订阅 tag。两者均支持精确值、`keyword:`、`regex:`，并区分大小写。
+3. 同一行内 `&&` 为 AND，支持 `!` 取反；不同 `filter:` 行之间为 OR。
+4. 每次订阅刷新都会重建过滤成员；节点 UUID 即使稳定，也不会在更换订阅后错误残留。
+5. 无 filters 且无嵌套组 → **全部节点**；仅有嵌套组 → **不是**全部节点。
 
 ### 嵌套组
 
@@ -272,12 +281,15 @@ group {
 
 ## 4. 路由（`routing { ... }`）
 
-dae 语法中每条规则一行：`条件函数 && 条件函数 -> 出站`，以 `fallback:` 收尾：
+dae 规则写作 `条件函数 && 条件函数 -> 出站`，按书写顺序匹配并以 `fallback:` 收尾。matcher 的括号参数可跨物理行，仍作为一条规则：
 
 ```
 routing {
     domain(suffix: google.com) -> proxy
     dip(geoip: cn) -> direct(must)
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
     fallback: direct
 }
 ```
@@ -298,7 +310,7 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 | ------ | ------ | -------- | ------ |
 | `name` | string | `""` | 显示名（dae 自动 `rule-N`） |
 | 条件字段 | 扁平 | | 见下表 |
-| `outbound` | string / complex | 必填 | 目标；dae 中 `->` 后为简单出站名 |
+| `outbound` | string | 必填 | 单个节点/组标签（dae 中 `->` 的右侧） |
 | `priority` | u32 | `0` | 越小优先级越高；dae 中按行序自动编号 |
 | `must` | bool | `false` | 非终结 must 规则；dae 中写作 `-> direct(must)` |
 | `mark` | u32 | `0` | fwmark；`0` = 无（结构化模型字段，dae 语法无对应写法） |
@@ -338,10 +350,6 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 | `mac` / `dscp` / `ipversion` | 同名字段 |
 
 `domain` 参数标签：裸值/`suffix:` → 后缀；`keyword:`；`full:`；`regex:`；`geosite:`（原样匹配；`category@attr` 按条目属性名过滤，同 dae 语义——大小写不敏感，第一个 `@` 之后整体为选择器；展开为零匹配时告警且永不命中）。
-
-### 复杂出站（仅结构化模型）
-
-dae 语法的 `->` 目标只接受简单出站名（节点 / 组标签）。结构化模型中保留了 `or` / `and` / `balancer` / `chain` 复合出站 schema，但 **balancer/chain 未像简单字符串出站那样完整接通**。优先使用组策略。
 
 ---
 
@@ -464,7 +472,12 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | `node_count` | u32 | `0` | 上次节点数 |
 | `created_at` | datetime | now | 创建时间 |
 
-节点仅存内存；周期刷新经控制面合并。
+节点仍只存在于运行时，不会写回配置文件。默认启用
+`global { store_subscribe: true }`：每次成功获取并解析的原始正文会原子写入
+`<运行目录>/.sub`；目录权限为 `0700`、文件权限为 `0600`，文件名由 URL 与
+请求身份散列得到。启动时先恢复有效缓存，再在后台联网刷新；已恢复的订阅不再占用
+5 秒首次拉取等待时间。重载先沿用当前节点，并为没有可沿用节点的已启用订阅读取缓存。
+拉取、解析或落盘失败时，当前节点与上一次有效缓存均保持不变。
 
 ---
 
@@ -489,7 +502,7 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | GET/PUT | `/proxies/{name}` | 详情 / 设置 Selector |
 | GET | `/proxies/{name}/delay` | 按需测速 |
 | GET | `/group/{name}/delay` | 组测速 |
-| GET | `/rules` | 规则 |
+| GET | `/rules` | 每条规则一行：简单 matcher 使用原生 Clash 类型；组合、取反或 `must` dae 规则使用 `complex` 并保留完整语句 |
 | GET/DELETE | `/connections` | 列表 / 关闭全部 |
 | DELETE | `/connections/{id}` | 关闭单个 |
 | GET | `/traffic` | WS 或分块 JSON 行 |
@@ -608,7 +621,8 @@ honk-core delay <node> [--url HOST:PORT]
 | UDP 探测 | 经节点 `dial_udp_transport` 向 `udp_check_dns` 发 DNS |
 | 按组 check URL | 配了 `check_url` 的组按其目标探测成员（子组成员经其当前选中节点探测，结果记到子组 tag,与 sing-box RealTag 一致）；(tag, url) 状态与全局独立——对该 URL 死亡只把该成员排除出该组 |
 | 并发 | 默认批次 10 |
-| 恢复 | 连续 2 次成功 |
+| 恢复 | 连续 2 次成功；相关网卡、地址或路由变化会清除旧退避，并让下一次成功探测直接验证恢复 |
+| 死亡节点重试 | 每 `min(5s, check_interval)` 重新检查退避已到期的死亡 TCP/UDP 协议族；实际探测仍遵循 5s→300s 指数退避 |
 | 深度退避 | 连续失败 10 次后仍以 max_cooldown（300s）慢速节奏继续探测，不永久停止 |
 | 拨号失败 | 清除延迟历史并注入一个 10s 合成罚样本（sing-box `DeleteURLTestHistory` + 防抖动）；节点 alive→dead 翻转时清除其连接池条目并回收 UDP endpoint |
 | UDP driver 失败 | transport 发送、接收或回包空闲超时会上报 DataUdp 流量失败；主动 endpoint 退役和进程关闭不影响健康状态 |

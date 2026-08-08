@@ -119,26 +119,6 @@ pub(super) struct ControlPlaneHandle {
     pub(super) udp_post_decision_offload: bool,
 }
 
-/// Check whether a connected TCP stream is still alive via SO_ERROR.
-///
-/// Returns true if the socket is healthy (no pending error).
-pub(super) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let mut err: libc::c_int = 0;
-    let mut err_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            &mut err as *mut _ as *mut libc::c_void,
-            &mut err_len,
-        )
-    };
-    ret == 0 && err == 0
-}
-
 /// Build the eBPF conntrack key for a flow: IPs as 16-byte v4-mapped
 /// addresses, ports in host byte order, `l4proto` as the IANA number.
 pub(crate) fn build_tuples_key(
@@ -432,23 +412,10 @@ impl ControlPlaneHandle {
             dscp: handoff.as_ref().map(|ho| ho.dscp),
         };
 
-        // Determine outbound: prefer eBPF handoff, fall back to userspace
-        // Router. `must` marks dae `(must)`-rule results (handoff must flag
-        // or a must-matched userspace rule) — final decisions exempt from
-        // the clash mode override below.
-        //
-        // Domain dial modes (domain / domain+ / domain++): an eBPF decision
-        // made without domain knowledge (e.g. fallback direct for an
-        // unlearned IP) is preliminary — once a domain is sniffed (and, in
-        // `domain` mode, verified), re-run the userspace router with it so
-        // domain rules apply.  must and block results stay final; only Ip
-        // mode takes the handoff decision as-is.
-        let reroute_by_sniffed_domain = !matches!(dial_mode, DialMode::Ip)
-            && domain.is_some()
-            && handoff
-                .as_ref()
-                .is_some_and(|ho| ho.must == 0 && ho.outbound != OutboundIndex::Block as u8);
-        let (outbound_name, must) = if let Some(ref ho) = handoff {
+        // prefer all 'direct' need handoff, even if in complex chain select 'direct' outbound
+        let reroute_by_sniffed_domain =
+            Self::should_reroute_sniffed_domain(dial_mode, domain.as_deref(), handoff.as_ref());
+        let (outbound_name, must) = if let Some(ho) = &handoff {
             debug!(
                 "eBPF handoff: outbound={}, mark=0x{:x}, dscp={}",
                 ho.outbound, ho.mark, ho.dscp
@@ -486,15 +453,11 @@ impl ControlPlaneHandle {
         // IP back into eBPF DOMAIN_ROUTING_MAP so the next connection to the
         // same IP can be fast-pathed by eBPF domain rules instead of being
         // sniffed again.
-        if let Some(ref domain) = domain {
-            let is_userspace_route = handoff
-                .as_ref()
-                .map(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
-                .unwrap_or(true);
-            if is_userspace_route {
-                self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
-                    .await;
-            }
+        if let Some(domain) = &domain
+            && Self::should_write_sniffed_domain_bitmap(handoff.as_ref(), reroute_by_sniffed_domain)
+        {
+            self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+                .await;
         }
 
         self.stats.record_connection(&outbound_name);
@@ -743,57 +706,53 @@ impl ControlPlaneHandle {
                 }
                 remaining -= 1;
                 match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
-                    Ok(Some(task_result)) => {
-                        match task_result {
-                            Ok((Ok(stream), idx, _elapsed)) => {
-                                let node = &candidates[idx];
-                                let ipver = if original_dst.is_ipv6() {
-                                    IpVersion::V6
-                                } else {
-                                    IpVersion::V4
-                                };
-                                ctx.alive_set.report_available_traffic(
-                                    node.id,
-                                    ProbeDomain::Tcp,
-                                    ipver,
-                                );
-                                winner = Some((stream, idx));
-                                set.abort_all();
-                                break;
+                    Ok(Some(task_result)) => match task_result {
+                        Ok((Ok(stream), idx, _elapsed)) => {
+                            let node = &candidates[idx];
+                            let ipver = if original_dst.is_ipv6() {
+                                IpVersion::V6
+                            } else {
+                                IpVersion::V4
+                            };
+                            ctx.alive_set.report_available_traffic(
+                                node.id,
+                                ProbeDomain::Tcp,
+                                ipver,
+                            );
+                            winner = Some((stream, idx));
+                            set.abort_all();
+                            break;
+                        }
+                        Ok((Err(e), idx, _elapsed)) => {
+                            let node = &candidates[idx];
+                            debug!("Parallel dial to {} failed: {}", node.name, e);
+                            ctx.stats.record_error(&outbound);
+                            let ipver = if original_dst.is_ipv6() {
+                                IpVersion::V6
+                            } else {
+                                IpVersion::V4
+                            };
+                            ctx.alive_set.report_unavailable_traffic(
+                                node.id,
+                                ProbeDomain::Tcp,
+                                ipver,
+                            );
+                            ctx.alive_set
+                                .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
+                            ctx.alive_set.notify_check_tcp(node.id);
+                            let msg = e.to_string();
+                            if msg.starts_with("dial timed out after") {
+                                timeout_count += 1;
                             }
-                            Ok((Err(e), idx, _elapsed)) => {
-                                let node = &candidates[idx];
-                                debug!("Parallel dial to {} failed: {}", node.name, e);
-                                ctx.stats.record_error(&outbound);
-                                let ipver = if original_dst.is_ipv6() {
-                                    IpVersion::V6
-                                } else {
-                                    IpVersion::V4
-                                };
-                                ctx.alive_set.report_unavailable_traffic(
-                                    node.id,
-                                    ProbeDomain::Tcp,
-                                    ipver,
-                                );
-                                ctx.alive_set
-                                    .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
-                                ctx.alive_set.notify_check_tcp(node.id);
-                                let msg = e.to_string();
-                                if msg.starts_with("dial timed out after") {
-                                    timeout_count += 1;
-                                }
-                                if first_err.is_none() {
-                                    first_err = Some((msg.clone(), node.name.clone()));
-                                }
-                                if remaining == 0 {
-                                    last_err = Some((msg, node.name.clone()));
-                                }
+                            if first_err.is_none() {
+                                first_err = Some((msg.clone(), node.name.clone()));
                             }
-                            Err(_join_err) => {
-                                // Task was cancelled (abort_all) or panicked — ignore.
+                            if remaining == 0 {
+                                last_err = Some((msg, node.name.clone()));
                             }
                         }
-                    }
+                        Err(_join_err) => {}
+                    },
                     Ok(None) => break,
                     Err(_elapsed) => {
                         set.abort_all();
@@ -1269,6 +1228,16 @@ impl ControlPlaneHandle {
             && handoff.is_some_and(|handoff| {
                 handoff.must == 0 && handoff.outbound != OutboundIndex::Block as u8
             })
+    }
+
+    fn should_write_sniffed_domain_bitmap(
+        handoff: Option<&HandoffResult>,
+        reroute_by_sniffed_domain: bool,
+    ) -> bool {
+        reroute_by_sniffed_domain
+            || handoff
+                .map(|handoff| handoff.outbound == OutboundIndex::ControlPlaneRouting as u8)
+                .unwrap_or(true)
     }
 
     pub(super) async fn serve_udp_connection(
@@ -1835,7 +1804,6 @@ impl ControlPlaneHandle {
                         break;
                     }
                 }
-                // Queue closed or budget exhausted.
                 _ => break,
             }
         }
@@ -2088,6 +2056,27 @@ mod sniffed_domain_routing_tests {
                 Some(&group)
             ));
         }
+    }
+
+    #[test]
+    fn tcp_domain_writeback_includes_preliminary_handoffs() {
+        for outbound in [OutboundIndex::Direct as u8, OutboundIndex::UserBase as u8] {
+            assert!(ControlPlaneHandle::should_write_sniffed_domain_bitmap(
+                Some(&handoff(outbound, 0)),
+                true,
+            ));
+        }
+        assert!(ControlPlaneHandle::should_write_sniffed_domain_bitmap(
+            Some(&handoff(OutboundIndex::ControlPlaneRouting as u8, 0)),
+            false,
+        ));
+        assert!(ControlPlaneHandle::should_write_sniffed_domain_bitmap(
+            None, false,
+        ));
+        assert!(!ControlPlaneHandle::should_write_sniffed_domain_bitmap(
+            Some(&handoff(OutboundIndex::Direct as u8, 0)),
+            false,
+        ));
     }
 
     #[test]

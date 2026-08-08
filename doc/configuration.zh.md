@@ -150,7 +150,7 @@ experimental {
 
 | 主题 | 关键字段 | 建议 |
 | ------ | ---------- | ------ |
-| 拦截网卡 | `lan_interface`、`wan_interface` | 省略 LAN 时不安装任何 LAN hook；已配置的 WAN hook 仍代理本机发起的 TCP/UDP。`auto` 解析默认路由网卡 |
+| 拦截网卡 | `lan_interface`、`wan_interface` | 省略 LAN 时不安装任何 LAN hook；已配置的 WAN hook 仍代理本机发起的 TCP/UDP。`auto` 跟随 IPv4 默认路由；没有默认路由时保持待定，并在网卡、地址或路由变化后自动挂载，无需重启；网关本机地址的 `direct(must)` 规则会同时重新发布，受健康状态控制的出站也会立即复测。 |
 | 监听 | `tproxy_port` | 默认 `12345`；`tproxy_mark`（默认 `0x08000000`）在 dae 语法中不可设置 |
 | 内核 | `auto_config_kernel_parameter` | 需 root；自动设置有用的 sysctl |
 | 健康检查 | `tcp_check_url`、`udp_check_dns`、`check_interval`、`check_tolerance` | 驱动 AliveDialerSet / URLTest；时长写作 `30s` / `50ms` |
@@ -210,9 +210,9 @@ honk 有三套互相独立的预热机制，全部有预算约束——都不随
 ```dae
 group {
     proxy {
-        filter: name(keyword: 'HK')
-        filter: name('us1')
-        filter: group('hk', 'jp')   # 嵌套子组（可选）
+        filter: subtag('my-sub') && !name(keyword: 'ExpireAt-')
+        filter: name('us1')              # 另一条 filter 与本行是 OR
+        filter: group('hk', 'jp')        # 嵌套子组（可选）
         policy: min_moving_avg      # fixed(0) | min_moving_avg | roundrobin | fallback
         default: 'us1'              # selector 默认节点
         final: direct               # 成员全死时的出站
@@ -228,13 +228,18 @@ group {
 | -------- | ------ |
 | `name('exact')` | 精确名称 |
 | `name(keyword: 'pat')` | 子串匹配 |
+| `name(regex: '^HK-')` | 正则匹配 |
+| `subtag('my-sub')` | 只选择 `subscription { ... }` 中该精确 tag 产生的节点 |
+| `subtag(regex: '^paid-', free)` | 订阅 tag 的正则或精确候选 |
+| `subtag('my-sub') && !name(keyword: 'ExpireAt-')` | 同一行内 AND；`!` 对单个条件取反 |
 | `group('hk')` / `group('hk', 'jp')` | 嵌套子组 |
 
 经验规则：
 
-- **无** filters 且 **无** 嵌套组 → 包含**全部**节点。
+- **无** filters 且 **无**嵌套组 → 包含**全部**节点。
 - 仅有嵌套组 → **不会**自动吞入全部节点。
-- 多个 `filter: name(...)` 行之间是 OR。
+- 每条 `filter:` 行之间是 OR；同一行以 `&&` 连接的条件是 AND，条件前加 `!` 表示取反。
+- `name(...)` 与 `subtag(...)` 均区分大小写。`subtag` 使用 `subscription` 中冒号左侧的 tag，静态节点不会匹配。
 
 **策略：**
 
@@ -247,13 +252,16 @@ group {
 
 ## 8. 路由（routing）
 
-规则有序，按源码书写顺序匹配（靠前优先），以 `fallback:` 收尾。
+规则有序，按源码书写顺序匹配（靠前优先），以 `fallback:` 收尾。matcher 的括号参数列表可以跨物理行书写，直到 `-> 出站` 仍算同一条规则。
 
 条件写成**函数调用**，可用 `&&` 组合：
 
 ```dae
 routing {
     domain(suffix: doubleclick.net) -> block
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
     fallback: direct
 }
 ```
@@ -377,9 +385,25 @@ subscription {
 
 dae 语法仅支持 `tag: 'url'` 形式；`sub_type`（simple | clash | sip008 | custom）、`update_interval`（秒，默认 86400，0 = 仅手动）、`enabled` 等字段使用默认值，在 dae 语法中不可设置。
 
-- 启动拉取有短截止时间；迟到结果经控制面通道合并。
-- 订阅节点**只在内存中**（不会回写配置文件）。
+- `global { store_subscribe: true }` 默认开启。成功获取且解析通过的原始正文会原子保存到 `<运行目录>/.sub`，目录权限 `0700`、文件权限 `0600`；缓存正文不会写回配置文件，请求身份只以散列文件名出现。
+- 启动时先恢复有效缓存。已有缓存的订阅可立即启动，同时继续后台联网刷新；无缓存的订阅仍保留 5 秒首次拉取等待时间。
+- SIGHUP 重载先沿用当前订阅节点；已启用但没有可沿用节点的订阅会从缓存恢复。拉取、解析或写入失败不会清空当前节点或上一次有效缓存；损坏缓存会被忽略，直到一次有效刷新替换它。
+- 订阅节点仍只存在于运行时，不会回写配置文件。修改 `store_subscribe` 后需重启进程。
 - 正文中的分享链接由 `Node::from_share_link` 解析。
+
+Clash YAML 的 VLESS 条目会在派生节点 ID 前映射 `uuid`（兼容旧
+`password`）、`servername`（回退到 `sni`）、`flow` 与 `network`。嵌套
+`reality-opts` 映射 `public-key`、`short-id`、`spider-x`（缺省 `/`）并启用
+REALITY TLS 承载；嵌套 `ws-opts` 映射 `path` 及大小写不敏感的
+`headers.Host`，`grpc-opts` 映射 `grpc-service-name`。原有扁平 WS/gRPC
+别名继续可用。若 VLESS 条目含 `reality-opts` 却没有非空 `public-key`，
+该条目会被跳过，不会静默降级成普通 TLS。Clash `client-fingerprint`
+不映射，因为 honk 的指纹选择是进程级而非节点级。
+
+VLESS 支持 plain/TLS/REALITY 承载上的 TCP、WS、gRPC；其中
+`xtls-rprx-vision` 必须使用 TLS 或 REALITY，且仅支持 TCP。其他 transport
+与 flow 只保留用于可见性，`honk-tool sub` 不会拨号；VLESS 没有 UDP
+packet handler。
 
 ## 11. Experimental
 

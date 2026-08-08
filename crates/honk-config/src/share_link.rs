@@ -283,14 +283,10 @@ impl Node {
             protocol,
             NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
         ) && let Some(v) = query.get("mtu")
+            && let Ok(mtu) = v.parse::<u16>()
+            && (1200..=65527).contains(&mtu)
         {
-            // Out-of-range values are dropped at parse time (clamped
-            // downstream as well).
-            if let Ok(mtu) = v.parse::<u16>()
-                && (1200..=65527).contains(&mtu)
-            {
-                node.quic_mtu = Some(mtu);
-            }
+            node.quic_mtu = Some(mtu);
         }
 
         if protocol == NodeProtocol::Tuic {
