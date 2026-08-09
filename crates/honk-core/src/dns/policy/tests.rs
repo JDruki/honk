@@ -120,6 +120,31 @@ fn semantic_policy_fields_change_identity() {
 }
 
 #[test]
+fn listener_bind_does_not_change_resolution_policy_identity() {
+    let base = representative_config();
+    let mut bound = base.clone();
+    bound.bind = "tcp+udp://127.0.0.1:53".into();
+
+    assert_eq!(
+        PolicyId::from_config(&base).expect("base policy"),
+        PolicyId::from_config(&bound).expect("bound policy"),
+    );
+}
+
+#[test]
+fn hosts_lookup_does_not_change_upstream_cache_identity() {
+    let base = representative_config();
+    let mut with_hosts = base.clone();
+    with_hosts.use_host = true;
+
+    // Hosts answers bypass the cache before routing; non-host upstream policy is unchanged.
+    assert_eq!(
+        PolicyId::from_config(&base).expect("base policy"),
+        PolicyId::from_config(&with_hosts).expect("hosts policy"),
+    );
+}
+
+#[test]
 fn request_and_response_rule_order_change_identity() {
     // Given
     let mut base = representative_config();

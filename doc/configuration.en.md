@@ -36,6 +36,26 @@ include {
 - The entry file's sections are merged first, followed by each included file and its descendants. Later scalar settings override earlier ones; nodes, groups, upstreams, and routing rules append in that order.
 - Repeating a file (including through a cycle) is rejected.
 
+
+### Runtime data directory
+
+`global.data_dir` selects the runtime-state root independently of the process
+`WorkingDirectory`. It must be a non-empty absolute path and defaults to
+`/var/share/honk`; changing it requires a process restart. New relative
+`experimental.cache_file.path` and `experimental.clash_api.external_ui` values
+target it, as does the durable `.sub` subscription store. Parent directories
+are created as needed. Absolute child paths remain literal. For upgrade
+compatibility, an existing cache relative to the original config directory, an
+existing `./.sub` store, or an existing working-directory-relative UI directory
+remains in use until moved below the configured data directory.
+
+Place runtime-supplied `geoip.dat`, `geosite.dat`, and a relative
+`ech_config_path` below `global.data_dir` to make systemd and manual starts
+behave identically. An explicit `$DAE_LOCATION_ASSET` geo directory takes
+precedence; otherwise geo assets fall back to the working directory and dae's
+standard asset directories. For compatibility, a relative `ech_config_path`
+falls back to its old working-directory-relative location when no data-directory
+copy exists.
 ## 2. Top-level structure
 
 ```text
@@ -303,7 +323,14 @@ Outbound targets: `direct`, `block`, any **group** or **node** name.
 
 **Must rules** (`-> direct(must)`): match does not finalize; continues matching and propagates must semantics (Go dae compatible). Clash Global/Direct mode does not override must/block.
 
-Geo assets: place `geoip.dat` / `geosite.dat` where the runtime can load them (repo root copies are common in dev). Geosite codes support dae's attribute filter: `domain(geosite: category-games@cn)` keeps only entries carrying the `@cn` attribute (key match is case-insensitive; everything after the first `@` is the selector). A code that expands to zero matchers — unknown category or unmatched attribute — logs a warning and never matches.
+Geo assets: place `geoip.dat` / `geosite.dat` below `global.data_dir` for a
+service-independent installation. An explicit `$DAE_LOCATION_ASSET` directory
+takes precedence; the loader otherwise falls back to the working directory and
+dae's standard asset directories. Geosite codes support dae's attribute filter:
+`domain(geosite: category-games@cn)` keeps only entries carrying the `@cn`
+attribute (key match is case-insensitive; everything after the first `@` is
+the selector). A code that expands to zero matchers — unknown category or
+unmatched attribute — logs a warning and never matches.
 
 ### Full routing snippet
 
@@ -342,7 +369,10 @@ To keep the router itself reachable no matter what:
 
 ```dae
 dns {
+    # Standalone listener is disabled unless bind is set.
+    # bind: 'tcp+udp://:1053'
     ipversion_prefer: 4
+    use_host: true
 
     upstream {
         alidns: 'udp://223.5.5.5:53'
@@ -381,10 +411,65 @@ dns {
 }
 ```
 
+`use_host` defaults to `false`. When enabled, honk loads `/etc/hosts` while
+building each DNS runtime generation. Matching IN-class A/AAAA queries are
+answered before request routing, cache lookup, or upstream exchange; a known
+name without the requested address family returns NOERROR/NODATA. Other query
+types continue through the normal pipeline. The snapshot is immutable on the
+query path and is refreshed by SIGHUP; an unreadable file fails startup or the
+new reload generation. Synthesized records advertise a 60-second TTL and are
+not inserted into honk's DNS cache.
+
 Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, `https://`, `quic://`, `h3://`; a bare `host:port` defaults to UDP.
 
-**Request outbounds:** named upstream, `reject` (empty success), `asis` (dial the intercepted original DNS destination).
-**Response outbounds:** `accept`, `reject`, or a named upstream to re-query.
+### Standalone listener (`dns.bind`)
+
+`bind` is optional. When it is absent or empty, only the standalone listener is
+disabled; transparent TCP and UDP port-53 interception continues unchanged.
+Accepted values are deliberately the current dae forms:
+
+```dae
+dns {
+    bind: '127.0.0.1:1053'          # bare numeric IP:port: UDP only
+    # bind: 'udp://localhost:1053'   # a hostname requires a scheme
+    # bind: 'tcp://[::1]:1053'       # bracket IPv6 literals
+    # bind: 'tcp+udp://:1053'        # empty host: wildcard, both transports
+}
+```
+
+Every form requires an explicit port; port `0` asks the kernel for an ephemeral
+port and the selected address is recorded in the startup log. A bare hostname
+such as `localhost:1053` is invalid, as are userinfo, paths, queries, and
+fragments. Hostnames are resolved in system order and the first address on
+which every requested transport can bind is selected. IPv6 zone identifiers
+are not supported; use a bracketed global, ULA, or loopback literal instead.
+
+The listener uses ordinary, unmarked sockets in the host network namespace. A
+LAN-facing local TCP or UDP listener on `:53` takes precedence for that
+transport; a wildcard socket is eligible only for a host-local destination, so
+queries to remote resolvers retain the transparent path. A wildcard or LAN
+bind exposes a recursive resolver without application-layer authentication;
+restrict it with host firewall policy and do not publish it to an untrusted
+network.
+
+Standalone requests use the same generation-pinned request/response routing,
+cache, singleflight, upstream pools, and routing projection as transparent
+requests. Only complete one-question DNS requests are admitted; a
+multi-question UDP request receives FORMERR and a multi-question TCP stream is
+closed before forwarding. UDP reply limits clamp the client EDNS size to
+`512..=1232` bytes; wildcard replies preserve the queried local destination
+address. TCP uses persistent RFC 7766 two-octet framing. Both transparent and
+standalone TCP bound every length/body read and response write to 30 seconds;
+the standalone listener also uses a cap no larger than one quarter of the
+global connection budget.
+
+Startup is all-or-nothing: every selected socket must bind before startup
+succeeds, and any bind failure closes the other selected sockets and fails the
+process. Listener ownership is process-scoped. A SIGHUP may reload the shared
+DNS runtime, but a semantic `bind` change (host, port, or transport set) is
+rejected as restart-required.
+**Request outbounds:** named upstream, `reject` (empty success), or `asis`. For a transparent query, `asis` dials the intercepted original DNS destination using the client's transport; UDP retries the same destination over TCP when the response is truncated. Dial/connect timeout remains separate; after connection/session acquisition, the DNS query timeout is one absolute deadline covering the complete request write and response read for each attempt. A transport may retry once, so the aggregate remains bounded to two query attempts plus bounded reset/setup. A standalone query has no original destination, so `asis` returns a DNS failure instead of dialing the listener recursively.
+**Response outbounds:** `accept`, `reject`, or a named upstream to re-query. All production service paths validate the exact question and complete response wire before cache publication.
 
 **Caveats today:**
 
@@ -399,13 +484,15 @@ Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, 
 
 - Omitting `ipversion_prefer` keeps the actual `DnsConfig` default, `both`.
   Eligible A and AAAA work runs concurrently. Setting `4` or `6` selects the
-  corresponding preference mode; it does not add a new configuration surface.
+  corresponding preference mode. Its sibling query preserves the caller's
+  complete wire profile and changes only QTYPE.
 - Cache and singleflight apply only to a standard one-question QUERY with no
   answer/authority records and at most one option-free EDNS-v0 OPT. Supported
   RD/AD/CD and DO state, exact question wire, UDP size, caller profile, policy,
-  and logical destination are part of identity. Multi-question, unusual flags,
-  EDNS options (including ECS/COOKIE), and EDNS-v1 requests still forward but
-  bypass cache and coalescing.
+  and logical destination are part of identity. Multi-question requests are
+  rejected before policy planning. Unusual flags, EDNS options (including
+  ECS/COOKIE), and EDNS-v1 requests still forward but bypass cache and
+  coalescing.
 - Reload publishes one coherent DNS runtime generation containing policy,
   routing, groups, transports, and projection. Existing requests keep their
   lease on the old generation while new requests use the replacement. Runtime
@@ -414,8 +501,8 @@ Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, 
   request recording non-blocking. An internal best-effort scrape loads fields
   separately and does not promise cross-counter coherence. Failure logs use
   bounded `error_kind` classes and bounded fields such as the transport label,
-  without query names, upstream addresses, or free-form error payloads. No
-  DNS endpoint, config key, or API was added.
+  without query names, upstream addresses, or free-form error payloads. This
+  internal telemetry adds no public DNS metric or API.
 
 ## 10. Subscriptions
 
@@ -427,7 +514,7 @@ subscription {
 
 Each entry is `tag: 'url'` (a bare quoted URL is also accepted). In dae syntax the subscription type, update interval, and enabled flag keep their defaults (auto/simple, 86400 s, enabled).
 
-- `global { store_subscribe: true }` is the default. A successfully fetched and parsed raw body is atomically stored under `<working-directory>/.sub` with private permissions (`0700` directory, `0600` files). The cached body is never written back into the config, and request identity appears only as a hash filename.
+- `global { store_subscribe: true }` is the default. A successfully fetched and parsed raw body is atomically stored in `.sub` below `global.data_dir` with private permissions (`0700` directory, `0600` files). An existing legacy `./.sub` store is retained until moved. The cached body is never written back into the config, and request identity appears only as a hash filename.
 - Startup restores valid stored bodies first. A restored subscription starts immediately while its network refresh continues in the background; an uncached subscription retains the five-second first-fetch grace period.
 - SIGHUP reload carries active subscription nodes and restores the stored body when an enabled subscription has no nodes to carry. Fetch, parse, or write failure leaves the active nodes and last valid body untouched. A corrupt body is ignored until a valid refresh replaces it.
 - Subscription nodes remain runtime-only and are never written back to the config file. Changing `store_subscribe` requires a process restart.
@@ -465,7 +552,7 @@ experimental {
 
 Useful endpoints: `/proxies`, `/proxies/{name}` (PUT selector), `/proxies/{name}/delay`, `/group/{name}/delay`, `/connections`, `/traffic`, `/logs`, `/dns/query`, `/stats`.
 
-Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing. The download follows the traffic routing decision (Router + group selection): `direct` fetches directly, `block` aborts it, any other outbound is dialed through the selected node.
+Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing. A relative `external_ui` prefers an existing directory below `global.data_dir`, then an existing working-directory-relative directory; a missing directory is created below `global.data_dir`. An absolute path is used unchanged. The download follows the traffic routing decision (Router + group selection): `direct` fetches directly, `block` aborts it, any other outbound is dialed through the selected node.
 
 ### Cache file
 
@@ -480,6 +567,11 @@ experimental {
     }
 }
 ```
+
+New relative `path` values resolve below `global.data_dir`; use an absolute path
+to keep the database elsewhere. When `<global.data_dir>/<path>` does not exist,
+an existing legacy path relative to the original config directory is retained
+until moved.
 
 Persists selector choices and clash mode. DNS answers use versioned `HDNS`
 records under the `dns:v2:` key namespace. Upgrade starts this namespace cold:

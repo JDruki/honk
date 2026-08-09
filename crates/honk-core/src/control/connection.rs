@@ -1,7 +1,7 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
-use crate::group::SelectionPlanMode;
+use crate::group::{SelectionNetwork, SelectionPlanMode};
 use honk_config::types::NodeProtocol;
 use std::collections::{HashMap, HashSet};
 
@@ -263,6 +263,13 @@ async fn wait_for_cold_urltest_release(index: usize) {
         tokio::time::sleep(COLD_URLTEST_STAGGER.saturating_mul(index as u32)).await;
     }
 }
+fn connection_chains(mut selection_chain: Vec<String>, node_name: &str) -> Vec<String> {
+    if selection_chain.last().map(String::as_str) != Some(node_name) {
+        selection_chain.push(node_name.to_owned());
+    }
+    selection_chain.reverse();
+    selection_chain
+}
 
 pub(super) struct ConnectionGuard {
     drain: Arc<DrainTracker>,
@@ -375,6 +382,19 @@ pub(super) fn udp_post_decision_offload_allowed(
 }
 
 impl ControlPlaneHandle {
+    /// `/proc/<pid>/exe` is display-only enrichment. Never hold first-packet
+    /// delivery behind the blocking pool used to resolve it.
+    fn spawn_process_path_enrichment(&self, conn_id: String, handoff: Option<&HandoffResult>) {
+        let Some(handoff) = handoff.filter(|handoff| handoff.pid != 0).cloned() else {
+            return;
+        };
+        let tracker = Arc::clone(&self.connection_tracker);
+        tokio::spawn(async move {
+            if let Some(process_path) = handoff.process_path().await {
+                tracker.update_process_path(&conn_id, process_path);
+            }
+        });
+    }
     /// Look up the eBPF routing handoff entry for a connection, consuming it.
     ///
     /// Only a read lock is taken: `routing_handoff_take` performs raw bpf()
@@ -680,10 +700,10 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        let (mut candidates, selection_mode) = {
+        let (mut candidates, selection_mode, selection_chain) = {
             let config = self.config.read().await;
             let gm = self.group_manager.read();
-            if let Some(group) = config
+            let (candidates, selection_mode) = if let Some(group) = config
                 .groups
                 .iter()
                 .find(|group| group.name == outbound_name)
@@ -698,7 +718,10 @@ impl ControlPlaneHandle {
                     resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::Tcp, ipver),
                     SelectionPlanMode::Authoritative,
                 )
-            }
+            };
+            let selection_chain =
+                gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Tcp);
+            (candidates, selection_mode, selection_chain)
         };
         // Only an unmeasured URLTest group is allowed to speculate. Its
         // candidate set is bounded before spawning so a large group cannot
@@ -1114,28 +1137,14 @@ impl ControlPlaneHandle {
         let (rule, rule_payload) = matched_rule
             .clone()
             .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-        let chains = {
-            let gm = self.group_manager.read();
-            let mut chain = gm.selection_chain(&outbound_name);
-            // Groups without a formed selection (LoadBalance, cold URLTest)
-            // stop at the group tag — append the actual dialed leaf.
-            if chain.last() != Some(&node.name) {
-                chain.push(node.name.clone());
-            }
-            chain.reverse();
-            chain
-        };
+        let chains = connection_chains(selection_chain, &node.name);
         // Live byte counters shared with the relay task: it increments them
         // as data flows so /connections shows real-time totals instead of a
         // single close-time (never-visible) update.
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let process_path = match &handoff {
-            Some(ho) => ho.process_path().await,
-            None => None,
-        };
         flow.track(crate::connection_tracker::ConnectionEntry {
-            id: conn_id,
+            id: conn_id.clone(),
             source: client_addr.to_string(),
             destination: resolved_target.to_string(),
             proxy: node.name.clone(),
@@ -1148,8 +1157,9 @@ impl ControlPlaneHandle {
             domain: target_domain.clone(),
             network: "tcp".to_string(),
             process: handoff.as_ref().and_then(|ho| ho.process_name()),
-            process_path,
+            process_path: None,
         });
+        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
 
         debug!(
             network = "tcp",
@@ -1649,10 +1659,13 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        let plan = {
+        let (plan, selection_chain) = {
             let config = self.config.read().await;
             let gm = self.group_manager.read();
-            resolve_udp_outbound_plan(&config, &gm, &outbound_name, requested_ipver)
+            let plan = resolve_udp_outbound_plan(&config, &gm, &outbound_name, requested_ipver);
+            let selection_chain =
+                gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Udp);
+            (plan, selection_chain)
         };
 
         if plan.nodes.is_empty() {
@@ -1807,20 +1820,8 @@ impl ControlPlaneHandle {
         let (rule, rule_payload) = matched_rule
             .clone()
             .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-        let chains = {
-            let gm = self.group_manager.read();
-            let mut chain = gm.selection_chain(&outbound_name);
-            if chain.last() != Some(&node.name) {
-                chain.push(node.name.clone());
-            }
-            chain.reverse();
-            chain
-        };
+        let chains = connection_chains(selection_chain, &node.name);
         let (conn_upload, conn_download) = endpoint.byte_counters();
-        let process_path = match &handoff {
-            Some(ho) => ho.process_path().await,
-            None => None,
-        };
         self.connection_tracker
             .register(crate::connection_tracker::ConnectionEntry {
                 id: conn_id.clone(),
@@ -1836,7 +1837,7 @@ impl ControlPlaneHandle {
                 domain: quic_domain.clone(),
                 network: "udp".to_string(),
                 process: handoff.as_ref().and_then(|ho| ho.process_name()),
-                process_path,
+                process_path: None,
             });
         endpoint.set_tracker(conn_id.clone());
         if !lease.set_tracker_id(conn_id.clone()) {
@@ -1882,6 +1883,7 @@ impl ControlPlaneHandle {
             anyhow::anyhow!("UDP initializer lost its first packet before driver start")
         })?;
         driver.start_with_followers(first, sniffed_followers)?;
+        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         if let Err(error) = driver.wait_first_ack().await {
             // PacketTransport Err and timeout are ambiguous: the winner may
             // have received part of the initial flight, so never replay it.

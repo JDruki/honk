@@ -33,6 +33,20 @@ include {
 - 先合并入口文件的各分段，再依次合并每个被包含文件及其子文件。后面的标量覆盖前面的值；节点、组、DNS 上游与路由规则按此顺序追加。
 - 同一文件被重复包含（包括循环）会报错。
 
+### 运行时数据目录
+
+`global.data_dir` 用于指定不依赖进程 `WorkingDirectory` 的运行时状态根目录。
+该值必须是非空绝对路径，默认 `/var/share/honk`；修改后需重启进程。新的相对
+`experimental.cache_file.path` 和 `experimental.clash_api.external_ui` 会指向该目录；
+订阅持久化也使用其下的 `.sub`。需要时会自动创建父目录；子项的绝对路径保持原样。
+为兼容升级，若原配置目录下已有相对缓存、已有 `./.sub`，或工作目录下已有相对 UI
+目录，则继续使用它，直至手动移到配置的数据目录。
+
+应将运行期提供的 `geoip.dat`、`geosite.dat` 和相对 `ech_config_path` 放到
+`global.data_dir` 下，使 systemd 和手工启动完全一致。显式 `$DAE_LOCATION_ASSET`
+的 Geo 目录优先；否则 Geo 文件回退到工作目录和 dae 标准资源目录。为兼容旧部署，
+当数据目录中不存在同名文件时，相对 `ech_config_path` 会回退到旧的工作目录相对位置。
+
 ## 2. 顶层结构
 
 ```text
@@ -284,7 +298,12 @@ routing {
 
 **Must 规则**（`-> direct(must)`）：命中不终结，继续匹配并传播 must 语义（兼容 Go dae）。Clash 的 Global/Direct 模式不会覆盖 must/block。
 
-Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置（开发时常用仓库根目录副本）。geosite 类目支持 dae 的属性过滤：`domain(geosite: category-games@cn)` 只保留带 `@cn` 属性的条目（属性名大小写不敏感；第一个 `@` 之后整体作为选择器）。展开为零匹配的 code（类目不存在或属性无命中）会告警且永不命中。
+Geo 资源：将 `geoip.dat` / `geosite.dat` 放到 `global.data_dir` 下，即可避免受
+服务工作目录影响。显式 `$DAE_LOCATION_ASSET` 目录优先；否则加载器回退到工作目录
+和 dae 标准资源目录。geosite 类目支持 dae 的属性过滤：
+`domain(geosite: category-games@cn)` 只保留带 `@cn` 属性的条目（属性名大小写
+不敏感；第一个 `@` 之后整体作为选择器）。展开为零匹配的 code（类目不存在或
+属性无命中）会告警且永不命中。
 
 ### 路由片段
 
@@ -312,7 +331,10 @@ honk 的数据面与 Go dae 一样是 fail-closed：健康检查判定 outbound 
 
 ```dae
 dns {
+    # 未设置 bind 时不启动独立监听。
+    # bind: 'tcp+udp://:1053'
     ipversion_prefer: 4
+    use_host: true
     optimistic_cache: true        # 缓存开关
     # 正缓存固定 TTL（覆盖应答 min TTL，并改写 wire RR TTL）。0 = 沿用上游应答 TTL。
     optimistic_cache_ttl: 600
@@ -345,10 +367,53 @@ dns {
 }
 ```
 
+`use_host` 默认为 `false`。启用后，honk 会在构建每个 DNS runtime generation 时
+加载 `/etc/hosts`。IN class 的 A/AAAA 查询命中后，会先于 request routing、缓存查询
+和上游交换直接应答；名称存在但缺少所请求的地址族时返回 NOERROR/NODATA，其他查询
+类型继续走原有管线。查询热路径只读不可变快照，SIGHUP 会重新加载；文件不可读会令
+启动失败，或令新的 reload generation 构建失败并保留旧 generation。合成记录的 TTL
+为 60 秒，且不写入 honk DNS 缓存。
+
 上游 URI 协议前缀：`udp://`、`tcp://`、`tcp+udp://`、`tls://`、`https://`、`h3://`、`quic://`；无前缀按 UDP 处理。
 
-**request 动作：** 命名上游、`reject`（空成功应答）、`asis`（拨向拦截包原始 DNS 目标）。
-**response 动作：** `accept`、`reject`、或命名上游重查。
+### 独立监听（`dns.bind`）
+
+`bind` 可省略；省略或设为空只会关闭独立监听，透明 TCP/UDP 53 端口拦截仍照常
+工作。只接受当前 dae 的下列形式：
+
+```dae
+dns {
+    bind: '127.0.0.1:1053'          # 裸数字 IP:port：仅 UDP
+    # bind: 'udp://localhost:1053'   # 主机名必须带 scheme
+    # bind: 'tcp://[::1]:1053'       # IPv6 字面量必须加方括号
+    # bind: 'tcp+udp://:1053'        # 空 host：通配地址，TCP+UDP
+}
+```
+
+每种形式都必须显式写端口；端口 `0` 表示让内核分配临时端口，最终地址会写入启动
+日志。裸主机名 `localhost:1053` 无效，userinfo、path、query 与 fragment 也不接受。
+主机名按系统解析顺序尝试，选择第一个能让全部请求 transport 成功 bind 的地址。
+目前不支持 IPv6 zone identifier；请改用带方括号的 global、ULA 或 loopback 字面量。
+
+监听器在 host netns 中使用普通、未打 mark 的 socket。LAN 侧已有的本地 TCP 或 UDP
+`:53` 监听对相应 transport 优先；通配 socket 只有在目的地址属于本机时才优先，因此
+发往远端 resolver 的查询仍走透明路径。通配或 LAN bind 会暴露一个没有应用层认证的
+递归 resolver；必须用主机防火墙限制来源，不能发布到不可信网络。
+
+独立请求与透明请求共享同一套 generation-pinned request/response routing、缓存、
+singleflight、上游连接池与路由投影。只接受完整的单问题 DNS 请求：多问题 UDP 请求
+返回 FORMERR，多问题 TCP stream 在转发前关闭。UDP 应答将客户端 EDNS size 钳制到
+`512..=1232` 字节；通配监听会保留查询命中的本地目的地址作为应答源地址。透明与
+独立 TCP 都支持 RFC 7766 双字节 framing 与持久连接，并将每次长度/正文读取及应答
+写入限制在 30 秒内；独立监听另受不超过全局连接预算四分之一的容量限制。
+
+启动采用 all-or-nothing：所有选中的 socket 都成功 bind 后才算启动成功；任一
+bind 失败会关闭其他已选 socket 并令进程启动失败。监听器归进程所有。SIGHUP
+可以重载共享 DNS runtime，但 `bind` 的语义变化（host、port 或 transport 集合）
+会被拒绝并提示必须重启。
+
+**request 动作：** 命名上游、`reject`（空成功应答）或 `asis`。透明查询的 `asis` 会使用客户端原 transport 拨向拦截包的原始 DNS 目标；UDP 应答带 TC 时会改用 TCP 重试。拨号/connect timeout 单独计时；连接/会话取得后，每次尝试只使用一个覆盖完整请求写入与应答读取的绝对 DNS query deadline。transport 最多重试一次，因此总时长受两次 query deadline 加有界 reset/setup 约束。独立查询没有原始目的地址，因此 `asis` 返回 DNS 失败，而不会递归拨回监听器。
+**response 动作：** `accept`、`reject`、或命名上游重查。所有生产 service 路径都会先校验精确 question 与完整 response wire，再发布到缓存。
 
 **当前限制：**
 
@@ -362,18 +427,20 @@ dns {
 **兼容性与生命周期：**
 
 - 未配置 `ipversion_prefer` 时保留实际的 `DnsConfig` 默认值 `both`，符合资格的
-  A 与 AAAA 工作并发执行。设置 `4` 或 `6` 选择相应的偏好模式；没有新增配置面。
+  A 与 AAAA 工作并发执行。设置 `4` 或 `6` 选择相应偏好模式；其 sibling 查询会
+  保留调用方的完整 wire profile，只修改 QTYPE。
 - 缓存与 singleflight 仅适用于标准单问题 QUERY：answer/authority 计数为零，最多
   一个无 option 的 EDNS-v0 OPT。受支持的 RD/AD/CD 与 DO 状态、精确 question wire、
-  UDP size、调用方 profile、策略和逻辑目的地都属于 identity。多问题、异常 flags、
-  EDNS option（包括 ECS/COOKIE）和 EDNS-v1 请求仍会转发，但绕过缓存与合并。
+  UDP size、调用方 profile、策略和逻辑目的地都属于 identity。多问题请求会在策略
+  规划前被拒绝；异常 flags、EDNS option（包括 ECS/COOKIE）和 EDNS-v1 请求仍会转发，
+  但绕过缓存与合并。
 - 重载一次发布包含策略、路由、组、transport 与投影的完整 DNS runtime generation。
   已有请求在旧 generation 上持有 lease，新请求使用替换版本。runtime 退役与池化
   transport 关闭都有界且会被等待。
 - DNS 可观测性仅供内部使用。相互独立、单调递增的 atomic counter 使请求记录保持
   non-blocking。内部 best-effort scrape 逐项读取，不承诺 counter 之间的一致性。
-  失败日志仅使用有界 `error_kind` 分类和 transport label 等有界字段，不记录 query name、
-  upstream 地址或自由格式 error payload。没有新增 DNS endpoint、配置项或 API。
+  失败日志只使用有界 `error_kind` 分类和 transport label 等有界字段，不记录 query name、
+  upstream 地址或自由格式 error payload。这些内部遥测不会新增公开 DNS metric 或 API。
 
 ## 10. 订阅（subscription）
 
@@ -385,7 +452,7 @@ subscription {
 
 dae 语法仅支持 `tag: 'url'` 形式；`sub_type`（simple | clash | sip008 | custom）、`update_interval`（秒，默认 86400，0 = 仅手动）、`enabled` 等字段使用默认值，在 dae 语法中不可设置。
 
-- `global { store_subscribe: true }` 默认开启。成功获取且解析通过的原始正文会原子保存到 `<运行目录>/.sub`，目录权限 `0700`、文件权限 `0600`；缓存正文不会写回配置文件，请求身份只以散列文件名出现。
+- `global { store_subscribe: true }` 默认开启。成功获取且解析通过的原始正文会原子保存到 `global.data_dir` 下的 `.sub`，目录权限 `0700`、文件权限 `0600`；已有旧 `./.sub` 会继续使用，直至手动迁移。缓存正文不会写回配置文件，请求身份只以散列文件名出现。
 - 启动时先恢复有效缓存。已有缓存的订阅可立即启动，同时继续后台联网刷新；无缓存的订阅仍保留 5 秒首次拉取等待时间。
 - SIGHUP 重载先沿用当前订阅节点；已启用但没有可沿用节点的订阅会从缓存恢复。拉取、解析或写入失败不会清空当前节点或上一次有效缓存；损坏缓存会被忽略，直到一次有效刷新替换它。
 - 订阅节点仍只存在于运行时，不会回写配置文件。修改 `store_subscribe` 后需重启进程。
@@ -422,7 +489,7 @@ experimental {
 
 常用接口：`/proxies`、`/proxies/{name}`（PUT 切换 Selector）、delay、`/connections`、`/traffic`、`/logs`、`/dns/query`、`/stats`。
 
-环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。下载走与用户流量相同的路由判定（Router + 组选择）：`direct` 直连下载，`block` 放弃下载，其余 outbound 经所选节点隧道下载。
+环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。相对 `external_ui` 优先使用 `global.data_dir` 下的已有目录，再使用已有工作目录相对目录；目录均不存在时在 `global.data_dir` 下创建。绝对路径保持原样。下载走与用户流量相同的路由判定（Router + 组选择）：`direct` 直连下载，`block` 放弃下载，其余 outbound 经所选节点隧道下载。
 
 ### 缓存文件
 
@@ -437,6 +504,8 @@ experimental {
     }
 }
 ```
+
+新的相对 `path` 解析到 `global.data_dir`；需要将数据库置于其他位置时请使用绝对路径。若 `<global.data_dir>/<path>` 不存在，则保留原配置目录下已有的相对路径，直至手动迁移。
 
 持久化 Selector 选择与 Clash 模式。DNS 应答使用 `dns:v2:` key 命名空间下的版本化
 `HDNS` 记录。升级时此命名空间冷启动：旧 DNS 行既不导入也不删除。恢复仅接受未过期、

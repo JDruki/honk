@@ -24,7 +24,8 @@
 | `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空时不安装任何 LAN hook；逗号分隔 |
 | `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；`auto` 跟随 IPv4 默认路由。默认路由不存在时保持待定（不会回退到 `lo`），并在网卡、地址或路由事件后自动挂载；同一事件还会重新发布网关本机地址的 `direct(must)` 规则，并立即复测受健康状态控制的出站。 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
-| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `<运行目录>/.sub`，供启动/重载在网络不可用时恢复；修改后需重启进程。 |
+| `data_dir` | string | `"/var/share/honk"` | 生成状态与相对运行时资源的绝对根目录；不能为空，修改后需重启进程。 |
+| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `global.data_dir` 下的 `.sub`，供启动/重载在网络不可用时恢复；已有 `./.sub` 会继续使用，直至手动迁移；修改后需重启进程。 |
 | `tcp_check_url` | string[] | gstatic HTTPS | TCP 健康检查目标；HTTPS 会先完成并校验目标 TLS，再发送配置的 HTTP 方法。 |
 | `tcp_check_http_method` | string | `"HEAD"` | URL 检查的 HTTP 方法 |
 | `udp_check_dns` | string[] | dns.google / 8.8.8.8 / IPv6 | UDP 健康检查 DNS 目标；逗号分隔 |
@@ -84,7 +85,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `skip_cert_verify` | bool | `false` | 跳过证书校验；链接 `allowInsecure` / `insecure` 参数 |
 | `ech_enabled` | bool | `false` | 提供 ECH；链接 `ech=1`（或 `ech_config` 隐式开启） |
 | `ech_config` | string? | null | Base64 编码的 ECHConfigList；链接 `ech_config` 参数 |
-| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径 |
+| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径；相对路径优先读取 `<global.data_dir>/<path>`，不存在时兼容旧的工作目录相对文件。 |
 | `reality_public_key` | string? | null | REALITY 服务端 X25519 公钥（分享链接 `pbk`）；设置后该节点走 REALITY 握手而非普通 TLS（`security=reality` 隐含 `tls=true`） |
 | `reality_short_id` | string? | null | REALITY short id（链接 `sid`，偶数长度 hex，至多 8 字节） |
 | `reality_spider_x` | string? | null | REALITY spider 路径（链接 `spx`，链接约定默认 `/`） |
@@ -357,7 +358,9 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 
 ```
 dns {
+    # bind: 'tcp+udp://:1053'   # 保持注释即可只用透明 DNS
     ipversion_prefer: 4
+    use_host: true
     upstream {
         homedns: 'udp+tcp://10.10.10.1:53'
     }
@@ -373,10 +376,62 @@ dns {
 
 | 字段 | 类型 | 默认值 | 含义 |
 | ------ | ------ | -------- | ------ |
+| `bind` | string | `""` | host netns 中可选的独立 UDP/TCP 监听；空值只关闭此监听 |
+| `use_host` | bool | `false` | 先于 DNS 路由、缓存和上游，用 `/etc/hosts` 应答 IN class A/AAAA 查询 |
 | `upstream` | list | 一个 `default` @ 223.5.5.5 UDP | 服务器；dae：`upstream { name: 'uri' }` |
 | `routing` | object | fallback 默认 | 请求路由；dae：`routing { request { ... } }` |
 | `strategy` | enum | 未指定时为 `both`；设置 `ipversion_prefer: 4\|6` 时分别为 `preferipv4`/`preferipv6` | 地址族策略 |
 | `cache` | object | 启用 | 缓存；dae：`optimistic_cache` / `optimistic_cache_ttl` / `max_cache_size` |
+
+### hosts 文件
+
+`use_host: true` 时，每次构建 DNS generation 都会读取一次 `/etc/hosts`。每个有效
+地址行的规范名和别名都会生效；匹配为精确、ASCII 大小写不敏感，末尾点会归一化，
+重复地址会去重，同时支持 IPv4 与 IPv6。无效地址行和注释会被忽略。
+
+`ipv4_only`/`ipv6_only` 的硬地址族过滤仍最先执行。除此之外，已知名称的 IN class
+A/AAAA 查询优先于 request 规则（包括 `reject`）、缓存条目和上游。名称存在但缺少所
+请求地址族时返回 NOERROR/NODATA，不会把查询泄漏给上游；非地址 qtype 与非 IN class
+仍走原路由管线。hosts 应答参与正常的 DNS 路由投影，wire TTL 为 60 秒，且绕过 honk
+应答缓存。
+
+加载后的表在该 DNS runtime generation 生命周期内不可变，查询路径不会读文件。
+修改 `/etc/hosts` 后需发送 SIGHUP；替换 generation 会原子加载新快照，已取得 lease
+的在途请求仍可在旧快照上结束。文件不可读会令启动失败，或在发布前中止 reload 并
+保留当前 generation。
+
+### 独立监听
+
+`dns.bind` 只接受下列 dae 兼容形式：
+
+| 值 | 监听 |
+| --- | ---- |
+| 省略或 `""` | 关闭；透明 TCP/UDP 53 端口拦截仍生效 |
+| 数字 `IP:port`，如 `127.0.0.1:1053` 或 `[::1]:1053` | 仅 UDP |
+| `udp://host:port` | UDP |
+| `tcp://host:port` | TCP |
+| `tcp+udp://host:port` | TCP 与 UDP |
+
+带 scheme 的形式可使用主机名（`udp://localhost:1053`）、方括号包裹的 IPv6
+字面量（`tcp://[::1]:1053`），或用空 host 表示通配地址
+（`tcp+udp://:1053`）。端口必须显式给出；`0` 表示申请临时端口，最终地址会写入
+日志。裸主机名、userinfo、path、query、fragment 和 IPv6 zone identifier 均无效。
+主机名选择第一个能让全部请求 transport 成功 bind 的解析地址。
+
+这些是在 host netns 中创建的普通、未打 mark 的 socket。LAN 侧本地 TCP 或 UDP
+`:53` 监听对相应 transport 优先；通配监听只有在目的地址属于本机时才优先。关闭
+`bind` 不会关闭透明 53 端口拦截。所有请求的 socket 会同步、all-or-nothing 地
+bind：任一失败会关闭其他 socket 并令启动失败。监听器归进程所有，因此 SIGHUP 中
+endpoint 语义变化会被拒绝并提示必须重启；endpoint 不变时继续使用新发布的 DNS
+runtime。通配和 LAN bind 会暴露无认证的递归 resolver，必须用主机防火墙限制来源。
+
+每个查询都取当前 `DnsServiceProvider` generation，因此与透明 DNS 共享
+request/response routing、缓存、singleflight、上游连接池和路由投影。只转发完整的
+单问题请求。UDP 应答将客户端 EDNS size 钳制到 `512..=1232`，且通配 socket 会保留
+查询命中的本地地址作为应答源。透明与独立 TCP DNS 都支持 RFC 7766 双字节 framing 与持久连接，并将每次长度/
+正文读取及应答写入限制在 30 秒内。独立 TCP 最多占用全局连接预算的四分之一。
+独立查询没有拦截所得的原始目的地址：若 request routing 选择 `asis`，honk 会返回
+DNS 失败，而不会递归拨回自己的监听器。
 
 ### 上游
 
@@ -394,7 +449,7 @@ dns {
 
 | 字段 | 含义 |
 | ------ | ------ |
-| `request { <条件> [&& <条件>...] -> <动作> }` | 请求规则，首条命中。条件：`qname(suffix:/keyword:/full:/regex:/geosite:...)`、`qtype(a/aaaa/...)`；`!` 取反。动作：`reject`、`asis`（拨查询的原始目的地址）或上游名 |
+| `request { <条件> [&& <条件>...] -> <动作> }` | 请求规则，首条命中。条件：`qname(suffix:/keyword:/full:/regex:/geosite:...)`、`qtype(a/aaaa/...)`；`!` 取反。动作：`reject`、`asis`（透明查询使用客户端原 transport 拨拦截所得原始目的地址，UDP TC 时改用 TCP 重试；独立查询返回 DNS 失败）或上游名 |
 | `request { fallback: <上游名> }` | 无请求规则命中时的上游 |
 | `response { <条件> [&& <条件>...] -> <动作> }` | 响应规则，首条命中。条件：`upstream(name)`、`qname(...)`、`ip(cidr, geoip:...)`；`!` 取反。动作：`accept`、`reject` 或上游名（重新查询，深度 ≤ 3） |
 | `response { fallback: accept\|reject }` | 无响应规则命中时的判定 |
@@ -405,7 +460,7 @@ dns {
 `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`
 
 - `ipv4only` / `ipv6only`：另一地址族的查询在请求期直接回 NODATA，不转发上游。
-- `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询。
+- `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询，并保留原查询除 QTYPE 外的完整 wire profile。
 - `both`：`DnsConfig` 的实际默认值；并发转发符合资格的 A 与 AAAA，两个地址族都不压制。honk 配置省略 `ipversion_prefer` 时保持此默认值。
 
 dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其他值 = `preferipv4`）；only 模式无法通过 dae 语法表达。
@@ -416,7 +471,7 @@ dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其�
 | ------ | -------- | ------ |
 | `enabled` | `true` | 开关。**dae：** `optimistic_cache` |
 | `ttl` | `600` | 正缓存固定 TTL（覆盖应答 min TTL；`0` 表示沿用上游）。**dae：** `optimistic_cache_ttl` |
-| `max_size` | `10000` | 最大条目；`0` 仍接受，但会告警并钳制为 `1`。**dae：** `max_cache_size` |
+| `max_size` | `10000` | 最大条目，同时按每条 4 KiB 限制保留的 query/response wire 总字节（每分片至少 65,535 字节、全局最多 64 MiB）；`0` 仍接受，但会告警并钳制为 `1`。**dae：** `max_cache_size` |
 
 可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。条目使用可回滚的
 `dns:v2:` 命名空间，只有 expiry、wire identity、入口 profile、scope、operation 与
@@ -425,9 +480,9 @@ dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其�
 
 缓存与 singleflight 共用资格判定。只有标准单问题 QUERY、answer/authority 计数为零、
 最多一个无 option 的 EDNS-v0 OPT 才符合资格。RD/AD/CD、DO、精确 question wire、
-UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔离。不受支持的
-flags、EDNS option（包括 ECS/COOKIE）、EDNS-v1 与多问题消息绕过这两项优化；取消会
-释放 flight。
+UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔离。多问题请求
+会在策略规划前被拒绝；不受支持的 flags、EDNS option（包括 ECS/COOKIE）与 EDNS-v1
+绕过这两项优化；取消会释放 flight。
 
 运行时 cache 与 singleflight key 共享同一份不可变二进制 query identity；
 operation 变体复用该分配，cache 分片使用预计算的运行时 hash。SQLite 文本编码
@@ -450,7 +505,7 @@ forwarder 为 `engine`/`exchange`/`response`/`internal`/`rejected_plan`，持久
 `worker_closed`/`ack_dropped`/`worker_failed`/`database`，投影为
 `map_full`/`backend_write`，transport 为 `exchange_failed` 并带有界 transport label。
 日志不记录 query name、upstream 地址或自由格式 error。`/stats` 仍是出站统计面；
-没有新增公开 DNS metric、endpoint、API 或调优项。
+runtime DNS 遥测不会新增公开 metric 或 API。
 
 ---
 
@@ -474,10 +529,11 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 
 节点仍只存在于运行时，不会写回配置文件。默认启用
 `global { store_subscribe: true }`：每次成功获取并解析的原始正文会原子写入
-`<运行目录>/.sub`；目录权限为 `0700`、文件权限为 `0600`，文件名由 URL 与
-请求身份散列得到。启动时先恢复有效缓存，再在后台联网刷新；已恢复的订阅不再占用
-5 秒首次拉取等待时间。重载先沿用当前节点，并为没有可沿用节点的已启用订阅读取缓存。
-拉取、解析或落盘失败时，当前节点与上一次有效缓存均保持不变。
+`global.data_dir` 下的 `.sub`；已有旧 `./.sub` 会继续使用，直至手动迁移。目录权限为
+`0700`、文件权限为 `0600`，文件名由 URL 与请求身份散列得到。启动时先恢复有效缓存，
+再在后台联网刷新；已恢复的订阅不再占用 5 秒首次拉取等待时间。重载先沿用当前节点，
+并为没有可沿用节点的已启用订阅读取缓存。拉取、解析或落盘失败时，当前节点与上一次
+有效缓存均保持不变。
 
 ---
 
@@ -488,7 +544,7 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `external_controller` | `""` | 监听地址；空 = 关闭 |
-| `external_ui` | `""` | 静态 UI 目录 |
+| `external_ui` | `""` | 静态 UI 目录；相对路径优先使用 `global.data_dir` 下的已有目录，再使用已有工作目录相对目录；不存在时指向 `global.data_dir` |
 | `secret` | `""` | Bearer / `?token=`；空 = 无鉴权 |
 | `default_mode` | `"Rule"` | `Rule` / `Global` / `Direct` |
 
@@ -566,7 +622,7 @@ QUIC client 槽。gauge 跟随当前 generation：资源排干后节点在下一
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `enabled` | `false` | 持久化 SQLite 缓存 |
-| `path` | `"cache.db"` | 数据库路径 |
+| `path` | `"cache.db"` | 数据库路径；相对路径优先使用 `global.data_dir`，再使用原配置目录下已有路径 |
 | `cache_id` | `""` | 命名空间 id |
 | `store_fakeip` | `false` | FakeIP 持久化意图（引擎未完成） |
 | `store_dns` | `false` | 持久化 DNS 应答 |

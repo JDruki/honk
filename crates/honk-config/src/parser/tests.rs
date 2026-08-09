@@ -51,6 +51,16 @@ global {
     }
 
     #[test]
+    fn test_parse_data_dir() {
+        let default = parse_dae_config("global {}").unwrap();
+        assert_eq!(default.global.data_dir, "/var/share/honk");
+
+        let custom = parse_dae_config("global {\n data_dir: '/srv/honk'\n}").unwrap();
+        assert_eq!(custom.global.data_dir, "/srv/honk");
+        custom.validate().unwrap();
+    }
+
+    #[test]
     fn test_parse_wan_only_global() {
         let input = r#"
 global {
@@ -118,6 +128,52 @@ dns {
         // Legacy `outbound:` still accepted.
         let legacy = &config.dns.upstream[8];
         assert_eq!(legacy.outbound.as_deref(), Some("oldproxy"));
+    }
+
+    #[test]
+    fn test_parse_dns_bind_scalar_and_current_dae_bare_udp() {
+        let bare = parse_dae_config("dns {\n bind: 127.0.0.1:53\n}").unwrap();
+        assert_eq!(bare.dns.bind, "127.0.0.1:53");
+        let endpoint = bare.dns.bind_endpoint().unwrap().unwrap();
+        assert!(endpoint.udp_enabled());
+        assert!(!endpoint.tcp_enabled());
+        assert_eq!(endpoint.host(), "127.0.0.1");
+        assert_eq!(endpoint.port(), 53);
+
+        let dual = parse_dae_config("dns {\n bind: 'TcP+UdP://[::1]:0'\n}").unwrap();
+        assert_eq!(dual.dns.bind, "TcP+UdP://[::1]:0");
+        let endpoint = dual.dns.bind_endpoint().unwrap().unwrap();
+        assert!(endpoint.udp_enabled());
+        assert!(endpoint.tcp_enabled());
+        assert_eq!(endpoint.host(), "::1");
+        assert_eq!(endpoint.port(), 0);
+
+        let commented =
+            parse_dae_config("dns {\n bind: 'udp://localhost:53' # local resolver\n}").unwrap();
+        assert_eq!(commented.dns.bind, "udp://localhost:53");
+    }
+
+    #[test]
+    fn test_parse_dns_bind_rejects_invalid_values_clearly() {
+        for value in [
+            "localhost:53",
+            "udp://localhost",
+            "udp://user@localhost:53",
+            "udp://localhost:53/path",
+            "udp://localhost:53?query",
+            "udp://localhost:53#fragment",
+            "udp+tcp://localhost:53",
+            "udp://[::1:53",
+            "udp://localhost:65536",
+        ] {
+            let input = format!("dns {{\n bind: '{value}'\n}}");
+            let error = parse_dae_config(&input).unwrap_err();
+            assert!(matches!(error, crate::ConfigError::Parse(_)), "{value}");
+            assert!(
+                error.to_string().contains("dns.bind"),
+                "error must identify dns.bind for {value}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1170,6 +1226,29 @@ dns {
 fn test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp() {
     let config = parse_dae_config("dns {\n    max_cache_size: 0\n}\n").unwrap();
     assert_eq!(config.dns.cache.max_size, 0);
+}
+
+#[test]
+fn use_host_defaults_off_and_parses_dae_boolean_forms() {
+    assert!(!parse_dae_config("dns {}").unwrap().dns.use_host);
+    assert!(
+        parse_dae_config("dns {\n    use_host: true\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
+    assert!(
+        parse_dae_config("dns {\n    use_host: on\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
+    assert!(
+        !parse_dae_config("dns {\n    use_host: false\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
 }
 
 #[test]

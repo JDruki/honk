@@ -1,6 +1,7 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
+use crate::dns::query::is_exact_dns_query;
 
 #[test]
 fn test_build_dns_probe_query() {
@@ -234,7 +235,8 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv4_multi_cmsg() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
     assert_eq!(
         packet_dst_ip,
@@ -242,6 +244,7 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv4_multi_cmsg() {
             198, 51, 100, 53
         )))
     );
+    assert_eq!(packet_ifindex, Some(0));
 }
 
 #[test]
@@ -258,7 +261,7 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv6_multi_cmsg() {
         ipi6_addr: libc::in6_addr {
             s6_addr: expected_packet.octets(),
         },
-        ipi6_ifindex: 0,
+        ipi6_ifindex: 7,
     };
     let mut storage = AlignedTestCmsgStorage::new();
     let mut used = 0;
@@ -277,9 +280,11 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv6_multi_cmsg() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("[2001:db8::4444]:4444")));
     assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V6(expected_packet)));
+    assert_eq!(packet_ifindex, Some(7));
 }
 
 #[test]
@@ -349,6 +354,7 @@ fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: Some(addr("0.0.0.0:53")),
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("192.0.2.20:5353"),
     };
 
@@ -532,7 +538,8 @@ fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
     assert_eq!(
         packet_dst_ip,
@@ -540,6 +547,7 @@ fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
             198, 51, 100, 53
         )))
     );
+    assert_eq!(packet_ifindex, Some(0));
 }
 
 async fn ready_udp_endpoint(
@@ -592,7 +600,7 @@ fn udp_original_dst_exact_dns_predicate_matches_controller_condition() {
 }
 
 #[test]
-fn udp_strict_dns_validator_accepts_complete_query_and_edns_only() {
+fn strict_dns_query_accepts_complete_query_and_edns_only() {
     let query = dns_query_payload();
     assert!(is_exact_dns_query(&query));
 
@@ -653,7 +661,7 @@ fn dns_query_with_qname(qname: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn udp_strict_dns_validator_enforces_expanded_name_limit_and_label_boundaries() {
+fn strict_dns_query_enforces_expanded_name_limit_and_label_boundaries() {
     // Four 63-byte labels + root expand to 257 octets (>255) and must fail.
     let mut overlong_name = Vec::new();
     for _ in 0..4 {
@@ -703,7 +711,7 @@ fn udp_strict_dns_validator_enforces_expanded_name_limit_and_label_boundaries() 
 }
 
 #[test]
-fn udp_strict_dns_validator_requires_controller_parseable_question() {
+fn strict_dns_query_requires_forwarder_parseable_question() {
     // Root qname is wire-valid but parse_dns_question rejects empty labels.
     let root = dns_query_with_qname(&[0x00]);
     assert!(crate::dns::forwarder::parse_dns_question(&root).is_none());
@@ -789,6 +797,7 @@ fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: Some(addr("203.0.113.10:4444")),
         packet_dst_ip: Some("198.51.100.10".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("192.0.2.10:5353"),
     };
 
@@ -815,6 +824,7 @@ fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip,
+        packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
     assert_eq!(
@@ -839,6 +849,7 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip,
+        packet_ifindex: None,
         local_addr: addr("[::]:15000"),
     };
     assert_eq!(
@@ -853,6 +864,7 @@ fn udp_original_dst_uses_non_wildcard_local_fallback() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: None,
+        packet_ifindex: None,
         local_addr,
     };
 
@@ -865,6 +877,7 @@ fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
         let meta = UdpRecvMeta {
             original_dst_cmsg: None,
             packet_dst_ip: None,
+            packet_ifindex: None,
             local_addr,
         };
         assert_eq!(udp_original_dst(&meta, b"opaque UDP"), None);
@@ -876,12 +889,14 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
     let packet_meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
     let local_fallback = addr("192.0.2.20:5353");
     let fallback_meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: None,
+        packet_ifindex: None,
         local_addr: local_fallback,
     };
     let mut dns_response = dns_query_payload();
@@ -1297,6 +1312,10 @@ enum UdpTestMode {
         sends: Arc<std::sync::atomic::AtomicUsize>,
     },
     Success,
+    TcpHold {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
     Hold {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -1382,13 +1401,23 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
     async fn dial(
         &self,
         _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
-        Err(anyhow::anyhow!(
-            "TCP dial is not used by the UDP lifecycle tests"
-        ))
+        let UdpTestMode::TcpHold { entered, release } = &self.mode else {
+            return Err(anyhow::anyhow!(
+                "TCP dial is not used by the UDP lifecycle tests"
+            ));
+        };
+        entered.notify_one();
+        release.notified().await;
+        let stream = TcpStream::connect(target).await?;
+        Ok(honk_outbound::proxy::ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_owned),
+        })
     }
 }
 
@@ -1630,6 +1659,217 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
             .redirect_track_lookup(&redirect_key)?
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut hk = Node {
+        name: "hk-140".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 140,
+        ..Default::default()
+    };
+    hk.id = hk.derive_id();
+    let mut us = Node {
+        name: "us-163".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 163,
+        ..Default::default()
+    };
+    us.id = us.derive_id();
+    let mut config = udp_test_config(
+        "devops",
+        vec![hk.clone(), us.clone()],
+        vec![Group {
+            name: "devops".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![hk.id, us.id],
+            default: Some(hk.name.clone()),
+            ..Default::default()
+        }],
+    );
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::TcpHold {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+        1,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    handle.ebpf.write().await.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            last_seen_ns: 1,
+            ..Default::default()
+        },
+    )?;
+    let task_handle = handle.clone();
+    let mut task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+
+    tokio::select! {
+        _ = entered.notified() => {}
+        result = &mut task => panic!("TCP handler exited before dial: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("TCP dial did not reach the injected handler")
+        }
+    }
+    assert_eq!(
+        handle.group_manager.read().selection_chain("devops"),
+        vec!["devops", "hk-140"]
+    );
+    handle
+        .group_manager
+        .read()
+        .set_selector_choice("devops", "us-163");
+    assert_eq!(
+        handle.group_manager.read().selection_chain("devops"),
+        vec!["devops", "us-163"]
+    );
+
+    release.notify_one();
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    let tracked = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(entry) = handle.connection_tracker.snapshot().into_iter().next() {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(tracked.proxy, "hk-140");
+    assert_eq!(tracked.chains, vec!["hk-140", "devops"]);
+
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
+    let mut tcp_node = Node {
+        name: "tcp-node".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 140,
+        ..Default::default()
+    };
+    tcp_node.id = tcp_node.derive_id();
+    let mut udp_node = Node {
+        name: "udp-node".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 163,
+        ..Default::default()
+    };
+    udp_node.id = udp_node.derive_id();
+    let config = udp_test_config(
+        "traffic",
+        vec![tcp_node.clone(), udp_node.clone()],
+        vec![Group {
+            name: "traffic".into(),
+            policy: honk_config::group::GroupPolicy::URLTest,
+            nodes: vec![tcp_node.id, udp_node.id],
+            ..Default::default()
+        }],
+    );
+    let handle = udp_test_handle(config, UdpTestMode::Success, 1);
+    handle.alive_set.record_probe_latency(
+        tcp_node.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    handle.alive_set.record_probe_latency(
+        udp_node.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    handle.alive_set.record_probe_latency(
+        tcp_node.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    handle.alive_set.record_probe_latency(
+        udp_node.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .select_node_for_domain("traffic", ProbeDomain::Tcp, IpVersion::V4)
+            .expect("TCP selection")
+            .name,
+        "tcp-node"
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .select_node_for_domain("traffic", ProbeDomain::DataUdp, IpVersion::V4)
+            .expect("UDP selection")
+            .name,
+        "udp-node"
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .selection_chain_for_network("traffic", crate::group::SelectionNetwork::Tcp),
+        vec!["traffic", "tcp-node"]
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .selection_chain_for_network("traffic", crate::group::SelectionNetwork::Udp),
+        vec!["traffic", "udp-node"]
+    );
+
+    serve_test_udp(&handle).await?;
+    let tracked = handle
+        .connection_tracker
+        .snapshot()
+        .into_iter()
+        .next()
+        .expect("ready UDP endpoint must be tracked");
+    assert_eq!(tracked.proxy, "udp-node");
+    assert_eq!(tracked.chains, vec!["udp-node", "traffic"]);
+    handle
+        .udp_pool
+        .remove(addr("10.0.0.2:53000"), addr("203.0.113.2:443"));
     Ok(())
 }
 
@@ -3487,6 +3727,7 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
     struct Cleanup {
         rule: Vec<String>,
         ns_cl: String,
+        forward_rules: Vec<(String, String)>,
         ns_srv: String,
         ip_forward_was: String,
     }
@@ -3495,6 +3736,20 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
             let _ = std::process::Command::new("iptables")
                 .args(&self.rule)
                 .output();
+            for (input, output) in &self.forward_rules {
+                let _ = std::process::Command::new("iptables")
+                    .args([
+                        "-D",
+                        "FORWARD",
+                        "-i",
+                        input.as_str(),
+                        "-o",
+                        output.as_str(),
+                        "-j",
+                        "ACCEPT",
+                    ])
+                    .output();
+            }
             let _ = std::process::Command::new("ip")
                 .args(["rule", "del", "fwmark", "0x66/0x66", "lookup", "106"])
                 .output();
@@ -3540,8 +3795,13 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    let forward_rules = vec![
+        (v_cl_br.clone(), v_srv_br.clone()),
+        (v_srv_br.clone(), v_cl_br.clone()),
+    ];
     let _cleanup = Cleanup {
         rule,
+        forward_rules: forward_rules.clone(),
         ns_cl: ns_cl.clone(),
         ns_srv: ns_srv.clone(),
         ip_forward_was,
@@ -3567,6 +3827,23 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
     run_cmd("ip", &["link", "set", &v_cl_br, "up"]);
     run_cmd("ip", &["addr", "add", "10.177.1.1/24", "dev", &v_srv_br]);
     run_cmd("ip", &["link", "set", &v_srv_br, "up"]);
+    // GitHub-hosted VMs default FORWARD to DROP. Admit only this test's veth pair.
+    for (input, output) in &forward_rules {
+        run_cmd(
+            "iptables",
+            &[
+                "-I",
+                "FORWARD",
+                "1",
+                "-i",
+                input.as_str(),
+                "-o",
+                output.as_str(),
+                "-j",
+                "ACCEPT",
+            ],
+        );
+    }
     for (ns, dev, ip_addr, gw) in [
         (&ns_cl, &v_cl, "10.177.0.2/24", "10.177.0.1"),
         (&ns_srv, &v_srv, "10.177.1.2/24", "10.177.1.1"),
@@ -5089,7 +5366,7 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     let mut removal_task = tokio::spawn(async {});
 
     tokio::time::timeout(Duration::from_secs(30), async {
-        cp.shutdown_datapath(&drain, &mut removal_task)
+        cp.shutdown_datapath(&drain, &mut removal_task, None)
             .await
             .unwrap();
         cp.finalize_shutdown().await.unwrap();

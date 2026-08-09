@@ -11,9 +11,91 @@ use crate::dns::query::IngressProfile;
 use crate::dns::singleflight::{FlightLeader, FlightRole};
 
 mod cache;
-mod flight;
+mod flight {
+    use std::sync::Arc;
+
+    use super::{ExecutionContext, cache};
+    use crate::dns::forwarder::DnsForwardError;
+    use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance};
+    use crate::dns::response::ResponseTemplate;
+    use crate::dns::singleflight::FlightLeader;
+
+    pub(super) fn publish_outcome(mut leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
+        if let Some(template) = outcome.template() {
+            leader.publish(Arc::new(template.clone()));
+        }
+        outcome
+    }
+
+    pub(super) async fn waiter_outcome(
+        context: &ExecutionContext<'_>,
+        template: Arc<ResponseTemplate>,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        if !context.bypass_cache_read
+            && let Some(outcome) = cache::lookup(context, false).await?
+        {
+            return Ok(outcome);
+        }
+        let response = template.render(context.prepared.query())?;
+        context.forwarder.outcome_from_wire(
+            context.engine,
+            context.prepared,
+            response,
+            None,
+            OutcomeStatus::Accepted,
+            Provenance::Upstream,
+            EffectiveExpiry::do_not_cache(),
+            None,
+            None,
+            Vec::new(),
+            context.mode,
+        )
+    }
+}
 mod operation;
-mod plan;
+mod plan {
+    use super::super::{DnsEngine, EngineError, PreparedQuery};
+    use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode, make_empty_response};
+    use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance};
+    use crate::dns::planner::{RequestPlan, RequestScope, UpstreamTag};
+
+    pub(super) fn request_exchange(
+        prepared: &PreparedQuery,
+    ) -> Result<(UpstreamTag, &RequestScope), DnsForwardError> {
+        match prepared.plan() {
+            RequestPlan::Exchange(scope @ RequestScope::AsIs(_)) => {
+                Ok((UpstreamTag::new("asis").map_err(EngineError::from)?, scope))
+            }
+            RequestPlan::Exchange(scope @ RequestScope::Upstream(upstream)) => {
+                Ok((upstream.clone(), scope))
+            }
+            RequestPlan::Reject => Err(DnsForwardError::RejectedPlanEscaped),
+        }
+    }
+
+    pub(super) fn rejected_outcome(
+        forwarder: &DnsForwarder,
+        engine: &DnsEngine,
+        prepared: &PreparedQuery,
+        raw_query: &[u8],
+        mode: ResolveMode,
+        status: OutcomeStatus,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        forwarder.outcome_from_wire(
+            engine,
+            prepared,
+            make_empty_response(raw_query, prepared.query()),
+            None,
+            status,
+            Provenance::Fresh,
+            EffectiveExpiry::do_not_cache(),
+            None,
+            None,
+            Vec::new(),
+            mode,
+        )
+    }
+}
 
 use plan::{rejected_outcome, request_exchange};
 
@@ -90,13 +172,18 @@ pub(crate) async fn resolve_with_owner(
     } = execution;
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
     let engine = forwarder.engine().await?;
-    let prepared = match mode {
-        ResolveMode::Strict => engine.prepare(raw_query, original_dst, ingress)?,
-        ResolveMode::Compatibility => {
-            engine.prepare_compatibility(raw_query, original_dst, ingress)?
-        }
-    };
-    let qtype = prepared.qtype();
+    let parsed = DnsEngine::parse_query(raw_query, ingress)?;
+    let qtype = parsed.qtype();
+    if !is_filtered_qtype(qtype, &forwarder.strategy)
+        && let Some(outcome) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
+    {
+        return Ok(outcome);
+    }
+    let prepared = engine.prepare_parsed(
+        parsed,
+        original_dst,
+        matches!(mode, ResolveMode::Compatibility),
+    )?;
     let reuse_eligible = prepared.is_cacheable() && prepared.is_coalescable();
 
     if is_filtered_qtype(qtype, &forwarder.strategy) {

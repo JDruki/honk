@@ -22,7 +22,8 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `lan_interface` | `lan_interface` | `[]` | LAN ifaces to intercept (comma-separated); empty installs no LAN hooks |
 | `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP. `auto` follows the IPv4 default route; while none exists it stays pending (never falls back to `lo`) and attaches on link/address/route events. The same event republishes generated gateway-address `direct(must)` rules and immediately re-probes health-backed outbounds. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Auto sysctl (root) |
-| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `<working-directory>/.sub` for network-independent startup/reload recovery. Changing it requires a process restart. |
+| `data_dir` | `data_dir` | `"/var/share/honk"` | Non-empty absolute root for generated state and relative runtime assets. Changing it requires a process restart. |
+| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body in `.sub` below `global.data_dir` for network-independent startup/reload recovery. An existing `./.sub` store is retained until moved. Changing it requires a process restart. |
 | `tcp_check_url` | `tcp_check_url` | gstatic HTTPS | TCP health target. HTTPS performs verified target TLS before the configured HTTP method. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method for URL checks |
 | `udp_check_dns` | `udp_check_dns` | dns.google / 8.8.8.8 / IPv6 | UDP health DNS targets (comma-separated) |
@@ -52,6 +53,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 global {
     tproxy_port: 12345
     log_level: info
+    data_dir: '/var/share/honk'
     lan_interface: podman0
     wan_interface: auto
     dial_mode: domain++
@@ -114,7 +116,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `skip_cert_verify` | bool | `false` | Insecure TLS (share-link `allowInsecure=1`/`insecure=1`) |
 | `ech_enabled` | bool | `false` | Offer ECH (share-link `ech=1`, or implied by `ech_config`) |
 | `ech_config` | string? | null | Base64 ECHConfigList (share-link `ech_config=`) |
-| `ech_config_path` | string? | null | File holding a base64 ECHConfigList |
+| `ech_config_path` | string? | null | File holding a base64 ECHConfigList. A relative path prefers `<global.data_dir>/<path>` and falls back to the legacy working-directory-relative file. |
 | `reality_public_key` | string? | null | REALITY server X25519 public key (share-link `pbk`); when set the node takes the REALITY handshake instead of plain TLS (`security=reality` implies `tls=true`) |
 | `reality_short_id` | string? | null | REALITY short id (share-link `sid`, even-length hex ≤ 8 bytes) |
 | `reality_spider_x` | string? | null | REALITY spider path (share-link `spx`, share-link default `/`) |
@@ -395,7 +397,9 @@ Multiple functions on one rule are AND'd with `&&`.
 
 ```dae
 dns {
+    # bind: 'tcp+udp://:1053'   # leave commented to keep standalone DNS off
     ipversion_prefer: 4
+    use_host: true
     optimistic_cache: true
     optimistic_cache_ttl: 600
     max_cache_size: 10000
@@ -416,12 +420,78 @@ dns {
 
 | dae key | Internal field | Default | Meaning |
 | ------- | -------------- | --------- | --------- |
+| `bind` | `bind` | `""` | Optional standalone UDP/TCP listener in the host network namespace; empty disables only this listener |
+| `use_host` | `use_host` | `false` | Resolve IN-class A/AAAA queries from `/etc/hosts` before DNS routing, cache, and upstreams |
 | `upstream { ... }` | `upstream` | one `default` @ 223.5.5.5 UDP | Servers |
 | `routing { ... }` | `routing` | fallback default | Request routing |
 | `ipversion_prefer` | `strategy` | `both` when omitted; `preferipv4`/`preferipv6` when set to `4`/`6` | Address-family preference (`4`/`6`) |
 | `optimistic_cache` | `cache.enabled` | `true` | Cache on/off |
 | `optimistic_cache_ttl` | `cache.ttl` | `600` | Fixed positive-cache TTL (overrides answer min TTL; `0` keeps answer TTL) |
-| `max_cache_size` | `cache.max_size` | `10000` | Max entries; `0` is accepted, warned, and clamped to `1` |
+| `max_cache_size` | `cache.max_size` | `10000` | Max entries; also scales the retained query/response wire-byte budget at 4 KiB/entry (minimum 65,535 bytes/shard, global maximum 64 MiB); `0` is accepted, warned, and clamped to `1` |
+
+### Hosts file
+
+With `use_host: true`, generation construction reads `/etc/hosts` once. Each
+valid address line contributes its canonical name and aliases; matching is
+exact and ASCII case-insensitive, trailing dots are normalized, duplicate
+addresses are removed, and both IPv4 and IPv6 are supported. Invalid-address
+lines and comments are ignored.
+
+Hard `ipv4_only`/`ipv6_only` strategy filtering remains first. Otherwise a
+known IN-class A/AAAA name takes precedence over request rules (including
+`reject`), cache entries, and upstreams. If the name exists but has no address
+in the requested family, honk returns NOERROR/NODATA instead of leaking the
+query upstream. Non-address qtypes and non-IN classes keep the normal routing
+path. Host answers participate in the normal DNS routing projection, advertise
+a 60-second TTL, and bypass honk's response cache.
+
+The loaded table is immutable for the lifetime of its DNS runtime generation;
+the query path never reads the file. Send SIGHUP after editing `/etc/hosts`.
+The replacement generation loads the new snapshot atomically while in-flight
+leases may finish on the old one. If the file cannot be read, startup fails or
+the reload aborts before publication, retaining the active generation.
+
+### Standalone listener
+
+`dns.bind` accepts exactly these dae-compatible forms:
+
+| Value | Listener |
+| ----- | -------- |
+| absent or `""` | Disabled; transparent TCP/UDP port-53 interception remains active |
+| numeric `IP:port`, for example `127.0.0.1:1053` or `[::1]:1053` | UDP only |
+| `udp://host:port` | UDP |
+| `tcp://host:port` | TCP |
+| `tcp+udp://host:port` | TCP and UDP |
+
+Schemed forms accept a hostname (`udp://localhost:1053`), a bracketed IPv6
+literal (`tcp://[::1]:1053`), or an empty host as a wildcard
+(`tcp+udp://:1053`). The port is always explicit; `0` requests an ephemeral
+port and the selected address is logged. A bare hostname is invalid, and
+userinfo, paths, queries, fragments, and IPv6 zone identifiers are rejected.
+Hostnames select the first resolved address on which every requested transport
+can bind.
+
+These are ordinary, unmarked host-netns sockets. A LAN-facing local TCP or UDP
+listener on `:53` takes precedence for its transport; wildcard precedence is
+limited to host-local destinations. Disabling `bind` does not disable
+transparent port-53 interception. All requested sockets are bound
+synchronously and all-or-nothing: one bind failure closes the others and fails
+startup. The listener is process-owned, so a semantic endpoint change on
+SIGHUP is rejected as restart-required; an unchanged endpoint continues using
+the newly published DNS runtime. Wildcard and LAN binds expose an unauthenticated
+recursive resolver and require host-firewall source restrictions.
+
+Each query uses the current `DnsServiceProvider` generation and therefore the
+same request/response routing, cache, singleflight, upstream pools, and routing
+projection as transparent DNS. Only complete single-question requests are
+forwarded. UDP reply limits clamp the client EDNS size to `512..=1232` and
+preserve the queried local address on wildcard sockets. TCP DNS on both transparent and standalone paths uses persistent RFC 7766
+two-octet framing and bounds every length/body read and response write to 30
+seconds. Standalone TCP consumes at most one quarter of the global connection
+budget.
+Standalone queries have no intercepted original destination: if request
+routing selects `asis`, honk returns a DNS failure rather than recursing into
+its own listener.
 
 ### Upstream
 
@@ -441,7 +511,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 
 | Item | Meaning |
 | ------ | --------- |
-| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (dial the query's original destination), or an upstream name |
+| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (transparent queries preserve the client transport when dialing the intercepted destination, with UDP TC→TCP retry; standalone queries return a DNS failure), or an upstream name |
 | `request { fallback: name }` | Upstream when no request rule matches |
 | `response { <cond> [&& <cond>...] -> <action> }` | Response rules, first match wins. Conditions: `upstream(name)`, `qname(...)`, `ip(cidr, geoip:...)`; `!` negates. Actions: `accept`, `reject`, or an upstream name (re-query, depth ≤ 3) |
 | `response { fallback: accept\|reject }` | Verdict when no response rule matches |
@@ -452,7 +522,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 Internal values: `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`.
 
 - `ipv4only` / `ipv6only`: the other family's queries are answered NODATA at request time and never forwarded upstream.
-- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss.
+- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss and preserves the original query wire profile except for QTYPE.
 - `both`: the default `DnsConfig` strategy; eligible A and AAAA queries are forwarded concurrently and neither family is suppressed. A missing `ipversion_prefer` in honk's config keeps this default.
 
 dae: `ipversion_prefer: 4` maps to `preferipv4`, `6` to `preferipv6` (anything else = `preferipv4`). The only-modes are not expressible in dae syntax.
@@ -465,9 +535,9 @@ Cache and singleflight eligibility are intentionally shared. Only a standard
 single-question QUERY with no answer/authority records and at most one
 option-free EDNS-v0 OPT is eligible. RD/AD/CD, DO, exact question wire, UDP
 size, ingress profile, policy, scope, and operation remain isolated in the
-key. Unsupported flags, EDNS options (including ECS/COOKIE), EDNS-v1, and
-multi-question messages bypass both optimizations; cancellation releases the
-flight.
+key. Multi-question requests are rejected before policy planning. Unsupported
+flags, EDNS options (including ECS/COOKIE), and EDNS-v1 bypass both
+optimizations; cancellation releases the flight.
 
 Runtime cache and singleflight keys share one immutable binary query identity;
 operation variants retain that allocation, and cache sharding uses a precomputed
@@ -495,8 +565,8 @@ bounded `error_kind` values: forwarder
 `worker_closed`/`ack_dropped`/`worker_failed`/`database`, projection
 `map_full`/`backend_write`, and transport `exchange_failed` with a bounded
 transport label. They do not log query names, upstream addresses, or
-free-form errors. `/stats` remains the outbound statistics surface; no public
-DNS metric, endpoint, API, or tuning key is added.
+free-form errors. `/stats` remains the outbound statistics surface; runtime
+DNS telemetry adds no public metric or API.
 
 ---
 
@@ -526,10 +596,10 @@ In dae syntax only `name` (the tag) and `url` are settable; the rest is runtime 
 
 Nodes remain runtime-only and are never written into the config file. With
 `global { store_subscribe: true }` (the default), each successfully fetched and
-parsed raw body is atomically stored under `<working-directory>/.sub`; the
-directory is mode `0700`, files are mode `0600`, and filenames are hashes of
-the URL plus request identity. Startup restores valid bodies before network
-refresh. A restored subscription does not consume the five-second first-fetch
+parsed raw body is atomically stored in `.sub` below `global.data_dir`; an
+existing legacy `./.sub` store is retained until moved. The directory is mode `0700`,
+files are mode `0600`, and filenames are hashes of the URL plus request identity.
+Startup restores valid bodies before network refresh. A restored subscription does not consume the five-second
 grace period, but its online refresh still runs in the background. Reload
 first carries active nodes and uses the stored body for any enabled subscription
 without carried nodes. Fetch, parse, or store failure keeps both the active
@@ -562,7 +632,7 @@ experimental {
 | Field | Default | Meaning |
 | ------- | --------- | --------- |
 | `external_controller` | `""` | Listen addr; empty = disabled |
-| `external_ui` | `""` | Static UI dir |
+| `external_ui` | `""` | Static UI dir; relative paths prefer an existing directory below `global.data_dir`, then an existing working-directory-relative directory; missing paths target `global.data_dir` |
 | `secret` | `""` | Bearer / `?token=`; empty = no auth |
 | `default_mode` | `"Rule"` | `Rule` / `Global` / `Direct` |
 
@@ -644,7 +714,7 @@ Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 | Field | Default | Meaning |
 | ------- | --------- | --------- |
 | `enabled` | `false` | Persist SQLite cache |
-| `path` | `"cache.db"` | DB path |
+| `path` | `"cache.db"` | DB path; relative paths prefer `global.data_dir`, then an existing path relative to the original config directory |
 | `cache_id` | `""` | Namespace id |
 | `store_fakeip` | `false` | FakeIP persistence intent (engine incomplete) |
 | `store_dns` | `false` | Persist DNS answers |

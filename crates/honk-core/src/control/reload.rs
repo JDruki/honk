@@ -341,11 +341,14 @@ impl ControlPlane {
             *group_guard = Arc::clone(&new_group_manager);
             *outbound_guard = new_outbound_id_map;
             *plan_guard = Arc::clone(&new_plan);
+            // The projection worker takes eBPF before its generation fence;
+            // install the snapshot under the same lock so no old batch can
+            // enter the newly activated datapath generation.
+            self.dns_controller
+                .update_projection_snapshot(projection_snapshot);
             old_registry
         };
 
-        self.dns_controller
-            .update_projection_snapshot(projection_snapshot);
         routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
         honk_outbound::bootstrap::set_global(bootstrap_resolver);
         self.alive_set.set_direct_check_addr(direct_target);
@@ -460,10 +463,15 @@ impl ControlPlane {
                 self.dns_controller.cache().await,
                 dns_router,
             )
+            .with_timeouts(
+                std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
+                std::time::Duration::from_millis(config.global.connect_timeout_ms),
+            )
             .with_strategy(config.dns.strategy.clone())
             .with_cache_enabled(config.dns.cache.enabled)
             .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
-            .with_policy_from_config(&config.dns)?,
+            .with_policy_from_config(&config.dns)?
+            .with_hosts_from_config(&config.dns)?,
         );
         Ok((forwarder, dns_upstream_pool))
     }
@@ -519,6 +527,13 @@ impl ControlPlane {
 /// has not mutated any live state.
 fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
+    let dns_bind_changed = match (current.dns.bind_endpoint(), candidate.dns.bind_endpoint()) {
+        (Ok(current), Ok(candidate)) => current != candidate,
+        _ => current.dns.bind != candidate.dns.bind,
+    };
+    if dns_bind_changed {
+        changed.push("dns.bind");
+    }
     let old_global = &current.global;
     let new_global = &candidate.global;
     if old_global.tproxy_port != new_global.tproxy_port {
@@ -547,6 +562,9 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
     }
     if old_global.auto_config_kernel_parameter != new_global.auto_config_kernel_parameter {
         changed.push("global.auto_config_kernel_parameter");
+    }
+    if old_global.data_dir != new_global.data_dir {
+        changed.push("global.data_dir");
     }
     if old_global.store_subscribe != new_global.store_subscribe {
         changed.push("global.store_subscribe");
@@ -1531,6 +1549,53 @@ mod atomic_reload_tests {
         assert_eq!(
             restart_required_changes(&current, &replacement),
             vec!["global.store_subscribe"]
+        );
+    }
+
+    #[test]
+    fn semantically_equivalent_dns_bind_does_not_require_restart() {
+        let mut current = Config::default();
+        current.dns.bind = "127.0.0.1:53".into();
+        let mut replacement = current.clone();
+        replacement.dns.bind = "udp://127.0.0.1:53".into();
+
+        assert!(restart_required_changes(&current, &replacement).is_empty());
+    }
+
+    #[test]
+    fn dns_bind_transport_change_requires_restart() {
+        let mut current = Config::default();
+        current.dns.bind = "udp://127.0.0.1:53".into();
+        let mut replacement = current.clone();
+        replacement.dns.bind = "tcp+udp://127.0.0.1:53".into();
+
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            vec!["dns.bind"]
+        );
+    }
+
+    #[test]
+    fn enabling_dns_bind_requires_restart() {
+        let current = Config::default();
+        let mut replacement = current.clone();
+        replacement.dns.bind = "tcp://127.0.0.1:0".into();
+
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            vec!["dns.bind"]
+        );
+    }
+
+    #[test]
+    fn data_directory_change_requires_restart() {
+        let current = Config::default();
+        let mut replacement = current.clone();
+        replacement.global.data_dir = "/srv/honk".into();
+
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            vec!["global.data_dir"]
         );
     }
 
