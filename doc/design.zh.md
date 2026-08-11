@@ -37,8 +37,9 @@ crates/
 ├── honk-config         # 配置 schema + 解析器 + 分享链接
 ├── honk-ebpf-common    # no_std #[repr(C)] 内核/用户态共享类型
 ├── honk-ebpf           # 内核程序（不在 workspace 内；bpfel-unknown-none）
+├── honk-nfqueue        # 单 raw-netlink 队列 + 自有 nftables 事务
 ├── honk-outbound       # 协议 Handler、组、AliveDialerSet、URLTest
-└── honk-core           # 引擎：控制面、DNS、中继、Clash API、eBPF 挂载
+└── honk-core           # 引擎：控制面、DNS、中继、Clash API、eBPF/NFQUEUE runtime
 ```
 
 ```mermaid
@@ -49,6 +50,7 @@ flowchart TB
   CORE --> COM[honk-ebpf-common]
   EBPF[honk-ebpf] --> COM
   CORE -->|嵌入目标文件| EBPF
+  CORE --> NFQ[honk-nfqueue]
 ```
 
 **ABI 规则：** 修改 map 键值或常量时，必须同步更新 `honk-ebpf-common`、`honk-ebpf` 以及 `honk-core` 中的用户态 map 写入逻辑。
@@ -65,6 +67,7 @@ flowchart TB
     TC[TC lan/wan ingress+egress]
     MAPS[MatchSet + handoff maps]
     DAE0[dae0 veth 169.254.0.1]
+    NFQ[inet prerouting / NFQUEUE 320]
   end
 
   subgraph daens
@@ -74,6 +77,7 @@ flowchart TB
   end
 
   subgraph Userspace
+    NFQL[honk-nfqueue raw-netlink listener]
     CP[ControlPlane]
     SNIFF[SNI / HTTP Host / QUIC SNI]
     R[Router 回退]
@@ -83,7 +87,8 @@ flowchart TB
   end
 
   APP --> TC --> MAPS
-  MAPS -->|代理 / 需用户态| DAE0 --> PEER --> SK --> LISTEN --> CP
+  MAPS -->|代理 / 普通用户态路径| DAE0 --> PEER --> SK --> LISTEN --> CP
+  MAPS -->|有歧义的 LAN UDP：pending + token| NFQ --> NFQL --> CP
   CP --> SNIFF --> R --> G --> D --> REL
   REL -->|SO_MARK bypass| WAN[WAN 出口]
   REL -->|UDP anyfrom 回包| PEER
@@ -97,15 +102,19 @@ flowchart TB
    - `direct + must` → 留在主机协议栈（不 redirect），任何模式皆如此。
    - 非 must 的 `direct` → 当按流卸载决定允许时同样留在主机协议栈（路由时决定一次，缓存在该流 `RoutingMeta` 位 57）：clash `Rule` 模式（或未启用 clash API）下，要求可证明无需 SNI 再评估——`dial_mode: ip`、路由配置无域名类规则、或该流域名已经 DNS 学习并在本次路由中经 `DOMAIN_ROUTING_MAP` 位图判定；clash `Direct` 模式下无条件卸载（用户态覆盖反正会改判 direct）。`Global` 模式——以及 `Rule` 模式下仍可能被域名改判的流——仍 redirect 进 `dae0`。
    - 用户出站 / block / 控制面路由 → 在出站存活时 redirect 进 `dae0`。（clash `Direct` 模式下非 must 的用户出站流改为按 direct 直通——同上述卸载。）
-4. 在 **daens** 中，`sk_lookup` 将流指派到透明 TCP/UDP 监听套接字。
-5. **用户态**取 handoff，可选嗅探域名，必要时走完整 `Router`，应用 Clash 模式覆盖，选组叶子，拨号并中继。
-6. 拨号/探测/DNS 上游套接字打上 **`DAE_BYPASS_MARK`（`0x100`）**，避免被 eBPF 再次代理。
-7. UDP 回包使用每 endpoint 的 **anyfrom** 透明套接字（对齐 dae），经 `dae0_ingress` 回写到客户端。
+4. 启用 `experimental { udp_nfqueue { enabled: true } }` 后，只有仍有歧义的 LAN 转发 UDP 决策会带唯一 token 标为 Pending，并在经过 LAN TC、进入 conntrack/NAT 之前由队列 `320` 保留。DNS 53、内部/特殊、反向、`must`、`block` 以及已可安全直连的流量保持普通路径。本机发起的 WAN 出口永远不会进入该 hook，仍走规范 TPROXY。
+5. 在 **daens** 中，`sk_lookup` 将普通用户态流指派给透明 TCP/UDP 监听套接字。
+6. **用户态**取 handoff，可选嗅探域名，必要时走完整 `Router`，应用 Clash 模式覆盖，选组叶子，拨号并中继。暂存 UDP 流改为通过下文的 token 校验 NFQUEUE 终态转换完成。
+7. 拨号/探测/DNS 上游套接字打上 **`DAE_BYPASS_MARK`（`0x100`）**，避免被 eBPF 再次代理。
+8. UDP 回包使用每 endpoint 的 **anyfrom** 透明套接字（对齐 dae），经 `dae0_ingress` 回写到客户端。
 
 启动 admission 在监听 generation 完整前保持 fail-open：当
 `DATAPATH_STATE_MAP[0]` 为 0 时，TC hook 原样放行流量。用户态发布全部 TCP/UDP
 监听 FD、启动接收循环后，才打开这一处 gate；关闭时则先关 gate 再拆监听。因此
 SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 listener slot。
+
+NFQUEUE readiness 是独立的 fail-closed gate。启用该特性但尚未 ready（启动、重载
+fence、关闭）时，需要暂存的新流会被丢弃；无需暂存的流量保持普通路径。
 
 > **说明：** 旧文档曾写主机桥上 `iptables TPROXY` 为主路径。当前实现是 **TC redirect + daens + sk_lookup**。监听仍为 `IP_TRANSPARENT`。清理脚本可能仍会删除历史遗留的 iptables 规则。
 
@@ -115,7 +124,7 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 
 | 程序族 | 挂载点 | 作用 |
 | -------- | -------- | ------ |
-| `lan_ingress_l2/l3` | TC ingress LAN | 分类、路由、redirect、TX 统计 |
+| `lan_ingress_l2/l3` | TC ingress LAN | 分类、路由、以唯一 token 暂存有歧义的 UDP、redirect、TX 统计 |
 | `wan_ingress_l2/l3` | TC ingress WAN | WAN / 回程（双臂时） |
 | `tproxy_lan/wan_egress_*` | TC egress | 本机发起流量 + 反向连接状态 |
 | `dae0_ingress` | TC ingress dae0 | 回程改写 + RX 统计 |
@@ -132,13 +141,16 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 | `DOMAIN_ROUTING_MAP` | IP → 域名规则位图（DNS 学习） |
 | `ROUTING_HANDOFF_MAP` | 五元组 → 用户态 handoff |
 | `REDIRECT_TRACK` / `CONN_STATE_MAP` | redirect 与 conntrack |
+| `UDP_DECISION_SEQUENCE` | 固定的一槽 spin-lock 两位 generation + 28 位 sequence；跨普通重启/清理保留；耗尽时 fence 并轮换到回滚安全的空 generation 后缀 |
+| `UDP_DECISION_EPOCH` / `UDP_DECISION_INFLIGHT` | 用户态切换的双槽 grace period 与 per-CPU reader；fence 只等待观察到旧槽的内核工作 |
+| `UDP_DECISION_RETIRE_FENCE` | 五元组 → 预期 token；精确 token 回收重验 state/辅助项期间阻止新 claim |
 | `BPF_STATS_MAP` | conn-state 溢出，以及 redirect/handoff/cookie 插入失败 |
 | `OUTBOUND_CONNECTIVITY_MAP` | 用户态健康检查推送的存活位 |
 | `OUTBOUND_STATS` | 每出站 per-CPU tx/rx 包/字节 |
 | `LISTEN_SOCKET_MAP` | 透明监听 SockMap |
 | `DATAPATH_STATE_MAP` | 仅在完整 listener generation 发布后打开的 admission gate |
-| `DATAPATH_FLAGS_MAP` | 用户态运行时写入的标志位：按模式的 direct 卸载策略（`DATAPATH_FLAG_OFFLOAD_RULE_DIRECT` / `_ALL` / `_NO_DOMAIN_RULES`），仅在新流路由决策时读取一次；决定按流缓存在 `RoutingMeta` 位 57 |
-| `EVENT_RINGBUF` | 溢出事件 → 用户态 tracing |
+| `DATAPATH_FLAGS_MAP` | 串行写入的运行时标志：按模式的 direct 卸载策略以及 NFQUEUE enabled/ready fence，在新流分类时读取 |
+| `EVENT_RINGBUF` | 对 datapath 溢出与 token 耗尽进行限速诊断记录；supervisor 独立轮询带锁的分配器状态 |
 
 ### 保留出站索引
 
@@ -154,7 +166,12 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 - **SYN 时刻**，若无 DNS 学习或用户态嗅探，纯域名规则往往无法命中。
 - DNS 应答会更新 `DOMAIN_ROUTING_MAP`，后续 TCP 可在 eBPF 内匹配。
 - 非 `must` 的 `direct` 仅在模式策略要求时进用户态——`Global` 模式全部如此，`Rule` 模式下仅当仍可能被 SNI 改判时（存在域名类规则、`dial_mode` 启用嗅探、且该流域名未经 DNS 学习）。其余情形它与 `must` direct 一样在内核卸载（对齐 Go dae）：不经用户态中继、不出现在 `/connections`、也不再走 SNI 改判；tx 统计仍在 `lan_ingress` 计数。`Direct` 模式下所有非 `must`/非 `block` 流均被卸载（覆盖反正会强制 direct）。卸载决定在路由时按流做一次并缓存在该流的 `RoutingMeta`（位 57）；策略字（`DATAPATH_FLAGS_MAP`）由用户态在启动时（按 cachedb 恢复的模式）、每次 PATCH `/configs` 切换模式时写入，并在每次 reload 后重新断言，只在流创建时生效。
-- （**实验特性，默认关闭**——用 `HONK_UDP_POST_DECISION_OFFLOAD=1` 开启。）首个数据报被确认是 QUIC Initial（成功解析出 SNI，或至少是能成功解密的合法 Initial）的 UDP 流，还可以在**用户态决策完全收敛为 `direct` 之后**再卸载，采用"暂存决策、同路径释放"（drop-and-reinject）：控制面原地改写该流已发布的 conn_state meta（`RoutingMeta::set_offloaded_direct`：outbound 归一为 `Direct`、清除 tproxy mark、置位 57），并**在不中继任何包的前提下**丢弃在途的 Initial（连同队列里的 follower）。QUIC 客户端必须重传丢失的 Initial（RFC 9000），重传包到达 `lan_ingress` 的 established-UDP 分支后内核直通——从服务端看到的第一个包起五元组就是客户端自己的，代价只是建流时一次 Initial RTO。非 QUIC 的 UDP 没有重传保证，因此绝不丢包、绝不走此卸载，保持用户态 relay 全程；代理决策与 53 端口同样永不卸载；`Global` 模式下非 `must` 流全部留在用户态（`Rule`/未启用 clash API 时卸载收敛为 direct 的决策，`Direct` 把所有非 `must`/非 `block` 决策归一为 direct——与路由时策略语义一致）。该分支发生在任何拨号之前，因此被卸载的流没有 endpoint、不进 `/connections`、不占 stats 连接数——用户态无任何残留；rx 字节也不计数（rx 在 `dae0_ingress` 记账），与 `must`-direct 完全一致。静默 120s 后 conn_state 被清扫，下一个 Initial 会原样重复一次"决策—丢弃—重传"循环。卸载位按流在决策时绑定，reload 或模式切换前建立的流保持其缓存决策。当决策由 sniff 出的域名驱动时，卸载还会把命中的域名规则 bitmap 回写到该目的 IP 的 `DOMAIN_ROUTING_MAP` 条目（与 DNS 学习路由同一张 map、同一生命周期：不受 conn_state 清扫影响，reload 后随既有机制重建），于是 conn_state 被清扫后，会话中途包（不是 Initial、无法再 sniff）在路由时被重新判定为 `DomainKnown → direct` 并直接内核卸载——零丢包、零用户态往返；缺少回写时，纯按 IP 的再决策可能把流中途翻转成代理。回写是 best-effort（失败只失去快速再决策，不影响流本身），且只发生在真正被卸载的流上：对用户态 relay 的流，清扫后的内核卸载会改变服务端可见五元组。卸载经由 lease 的 `commit_offloaded` 终态提交（`KernelOffloadHandoff` 回收原因——endpoint 回收 worker 只对 `UserspaceEndpointRetired` 删除 conn_state），刚写入的卸载位绝不会被预约析构拆除。跨 CRYPTO 分片的 ClientHello 会先从 follower 队列收齐再决策（上限：8 包 / 250ms）；仍收不齐的流按未决丢弃（已确认 QUIC 必重传，sniffer 会话已持有这些分片），绝不按纯 IP 猜测决策而绕过域名规则。实测代价：每条被卸载的流在建流时多付一个 Initial PTO——50ms 初始 RTT 下约 136ms（≈2–3× RTT），一次性；已建立的流不受影响。覆盖边界：只有命中域名规则的决策才有 bitmap 可回写——fallback direct、IP/CIDR 规则 direct、否定域名规则命中的 direct 都没有 `DOMAIN_ROUTING_MAP` 条目，它们清扫后的会话中途包会回到用户态 relay（QUIC 连接迁移可吸收这次五元组变化；曾评估过独立的 per-tuple 内核决策缓存，因其内核 ABI 代价与这个 120s 空闲边角场景不成比例而放弃）。
+- 首包保留路径是**实验特性且默认关闭**。只能用 `experimental { udp_nfqueue { enabled: true } }` 启用；修改该值后必须重启，启用时会拒绝 `--mock-ebpf` 或不带 `ebpf` 的构建。
+- 范围仅为 LAN 转发 UDP，因为主机 `inet prerouting` 位于 LAN TC 之后。本机发起的 WAN 出口仍走规范 TPROXY。53 端口、内部/特殊流量、反向流量、`must`、`block` 和已经可以安全地在路由时直连的决策均被排除；只有仍可能收敛为不同结果的 preliminary direct/control-plane 或依赖域名/QUIC 的 proxy 决策才会暂存。
+- eBPF 从持久 pin 的 `UDP_DECISION_SEQUENCE` 分配非零 token；token 由两位 generation 和 28 位 sequence 组成。pin 保留旧版 12 字节 raw-counter ABI，因此启动只校验、不改写，回滚后会从同一数值边界继续。eBPF 发布 token 绑定的 handoff/redirect/`ConnState::Pending`，再把 skb 标为 Pending。唯一的 raw-netlink listener 向同时受 256 项和 8 MiB payload 上限约束的 ingest actor 投递；slow permit 只在 actor 出队时获取。所有 backend 锁等待（包括 Arm 后的 Activate）都沿用从 listener 收包开始计算的固定三秒绝对期限；饱和或超期均 fail closed 丢包。独立的一秒 sampler 分别刷新内核队列与本地 guard/actor gauge，因此 dispatcher 停顿或 procfs 失败不会掩盖本地压力。队列 `320` 在 conntrack/NAT 之前保留原始 skb；没有 bypass、fanout 或 fail-open。
+- 最终 direct 执行 token 校验的 Arm → 按 FIFO 以最终 direct mark `NF_ACCEPT` 每个原始 skb → Activate。Arm 后到达的 follower 只追加 verdict guard；其 payload 与 slow permit 会被丢弃，不经过 endpoint admission。Direct 不创建用户态 socket、不保留 payload 副本、不故意触发重传，也不创建 UDP endpoint 或 `/connections` 条目。最终 proxy 在回包可能发生竞争前提交 token 绑定的 outbound/mark，把唯一 payload 副本转交给规范初始化器，丢弃原始 skb，并且只拨号/发送一次。Block 与取消丢弃原始 skb。任何终态转换都不能修改缺失、旧 token、错误 state 或更新的五元组 incarnation。
+- 重载与关闭先发布 NFQUEUE-not-ready，切换双槽 decision epoch，等待所有 fence 前的 per-CPU reader，并删除残留 Preparing/Pending state。延迟队列包因此无法跨 runtime generation。精确回收另行安装 `BPF_NOEXIST` 五元组 fence，等待 fence 前 reader，重新校验并删除。sequence 耗尽时使用同一 fence/drain 协议：关闭旧队列，等待所有 verdict guard、correlator cell 与延期 token cleanup，再选择 conn-state、handoff、redirect 与 retirement-fence map 均未使用的 generation；完整扫描会跨越成功但不足一批的 BPF batch，直到终止 `ENOENT`。若四个都仍存活，则按 1、2、5、30 秒退避重试并保持 staging fenced。队列、listener、verdict 与 cleanup 故障仍为致命错误；正常回滚会原样保留 raw allocator pin。
+- 为保证回滚安全，候选 generation 及其到 generation 3 的所有更高 generation 都必须未出现在这四类 map 中。旧 allocator 会从重置后的 raw 值开始，并且只会沿该后缀单调递增；没有安全后缀时，staging 保持 fenced 并退避重试。
 - TCP SNI/HTTP Host 与 QUIC Initial SNI 在域名感知模式下都会对非 `must`、非 `block` handoff 重新执行用户态 Router。
 
 ## 7. 用户态控制面
@@ -164,8 +181,9 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 | 子系统 | 职责 |
 | -------- | ------ |
 | Netns / veth | 创建 `daens`、`dae0`/`dae0peer`、地址与策略路由 |
-| `EbpfBackend` | 加载/挂载程序、写 map、统计；测试用 Mock |
-| Accept 循环 | 透明 TCP/UDP、原始目的地址、handoff |
+| `EbpfBackend` | 加载/挂载程序、发布 map、检查 token/state、提交终态、只中止/移除匹配 token 的 incarnation、校验并轮换持久分配器；Mock 供非 NFQUEUE 测试使用 |
+| NFQUEUE runtime | `honk-nfqueue` 队列/表所有权、有界 ingest actor、`PendingUdpVerdicts` correlator、watchdog、压力指标、致命故障监督及重载/关闭/耗尽 fence |
+| Accept 循环 | 透明 TCP/UDP、原始目的地址、获取 handoff |
 | `Router` | 完整条件集（域名/geoip/geosite/进程/…） |
 | 嗅探 | TCP SNI/Host、QUIC SNI |
 | DNS | 缓存、路由、转发、可选 SQLite 持久化 |
@@ -220,6 +238,13 @@ transport 及 anyfrom 回包 socket 后，driver 到达 ready barrier，lease �
 首包和稳态发送的 timeout 都是五秒；timeout 或错误均可能已送达，因此绝不改由
 另一个 candidate 重放该包。
 
+NFQUEUE ingress 会复用该初始化器，而不是创建第二条 UDP 路径。
+`PendingUdpVerdicts` 只保存 token/generation 身份、FIFO verdict guard、phase 与最终
+direct mark；payload、路由、嗅探、candidate、拨号和取消所有权仍在
+`UdpInitLease` / `UdpEndpointPool` 中。Direct 从不发布 endpoint。Proxy 在现有初始化器
+发布/拨号/发送前先提交内核状态，因此保留 payload 只发送一次；endpoint 退役使用
+token + generation tombstone，延迟 cleanup 无法删除 replacement。
+
 **队列与进程预算也是所有权上限。** 每 flow 最多保留 64 个 datagram（含首包），
 全部 flow 的 payload 合计最多 8 MiB。slow admission 和 flow/global permit
 在分配或复制 payload 前取得；后续包按 FIFO 且非阻塞，饱和时丢弃最新包。启动时只
@@ -255,9 +280,10 @@ application send 之前完成 promotion/arbitration。
 
 **Warm 所有权按 generation 管理，并按策略原因独立保留。** 每个 Selector
 提供其配置叶节点（运行时选择优先，其次 default，再其次首个成员）；多个
-Selector 共享的叶节点按 UUID 去重。AnyTLS 保留一条池 session，
-TUIC/Juicity/Hysteria2 保留 QUIC client 与 connection，其他代理协议保留一条
-到服务端的裸 TCP。Selector 的有效选择变化会立即唤醒 reconciliation，另有
+Selector 共享的叶节点按 UUID 去重。AnyTLS、VLESS H2MUX 与 VLESS Mux.Cool
+保留一条池 session，TUIC/Juicity/Hysteria2 保留 QUIC client 与 connection，
+其他代理协议保留一条到服务端的裸 TCP。Selector 的有效选择变化会立即唤醒
+reconciliation，另有
 10 秒周期修复死亡、被消费或已过期的资源。最后一个 Selector 所有者消失时
 只排干可复用状态；活动 flow 继续持有自己的 stream/connection，reload 时未变
 runtime 延续所有权。启动 preconnect 与此分离：它只做一次裸 TCP 预置，不持有
@@ -265,10 +291,11 @@ Selector/UDP retention bit。
 
 **UDP warm-up 仍为 opt-in。** `global.udp_warm_node_count=0` 不创建 UDP
 coordinator，也不产生 attempt metrics。预算为正时，只合并每组拥有可复用 UDP
-generation 状态的延迟 top-N 叶节点（AnyTLS/TUIC/Juicity/Hysteria2），按 UUID
+generation 状态的延迟 top-N 叶节点（AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/
+TUIC/Juicity/Hysteria2），按 UUID
 去重后再受进程级 `4×N` 上限约束。每次最多并发四个握手；启动时立即执行一次，
 之后每次都在上一批完成并经过配置的检查间隔后执行。Selector 与 UDP 使用独立
-bit，因此共享的 AnyTLS/QUIC 资源只在最后一种所有权消失后释放。reload 会让旧
+bit，因此共享的 session/client 资源只在最后一种所有权消失后释放。reload 会让旧
 generation 拒绝新的 warm 工作，但已有 stream 与 Ready UDP endpoint 正常排干。
 `Ready` 记为 success；通用的 `NotApplicable` 结果保持中性。
 
@@ -284,8 +311,26 @@ generation 拒绝新的 warm 工作，但已有 stream 与 Ready UDP endpoint �
 - `quic.rs` — Hy2 / TUIC / Juicity 共用 quinn 客户端
 - `tls.rs` — BoringSSL TLS 与 Chrome 指纹辅助
 - `reality.rs` — REALITY 客户端握手（见下文）
+- `vless_encryption.rs` — 兼容 Xray 的 VLESS Encryption 认证、混合前向保密、ticket 0-RTT 与 record framing
+- `uot.rs` — AnyTLS 与 VLESS 直连 UoT v2 共用的 packet codec
+- `vless_mux.rs` — sing-mux H2MUX carrier、可选 v1 padding、逻辑 TCP 与原生 connected UDP
+- `vless_cool.rs` — Xray Mux.Cool 有序 carrier、逻辑 TCP、Single/池化 XUDP 与 full-cone 回包元数据
 
 VMess 与 VLESS 由 honk-outbound 的 `rprx` cargo feature 编译（honk-core 默认构建开启）；不带该 feature 时节点可解析，但拨号以 "No handler for protocol" 拒绝。
+
+### VLESS mode
+
+`Node.vless_mode: WireMode` 把行为归一化为六种互斥且不协商的 contract。`legacy` 保留原 TCP 路径且无 packet 能力；`uot-v2` 保持 TCP 不变，并为每个 connected UDP transport 新建一条直连 UoT v2 stream；`xudp` 同样保持 TCP 不变，但为每个 UDP transport 建立一条 VLESS mux-command carrier，并使用 XUDP session id 0。
+
+`h2mux` 向 `sp.mux.sing-box.arpa:444` 发出 VLESS 请求、选择 H2MUX backend 2，再打开 HTTP/2 CONNECT stream，首个 DATA 为 `[flags u16][SocksAddr]`——flag 0 承载逻辑 TCP，flag 1 通过共用 UoT 长度 codec 承载 connected UDP。`h2mux-padded` 再增加 sing-mux v1 随机 preface，并对每个方向前 16 个 record 做 padding framing。每个 H2MUX 节点拥有 `SessionPool<VlessMuxSession>`，上限为两条可复用或正在拨号的物理 carrier × 每条 128 个逻辑 stream；draining carrier 可在现有 stream 结束前与 replacement 重叠。HTTP/2 capacity 决定 admission；GOAWAY 与提交前 session 故障会排干并重试一次，目标拒绝不重试。driver 故障向所有子流传播；stream wrapper 保留 flow-control capacity 释放、half-close、reset 与惰性响应错误。
+
+`mux-cool` 打开 Xray VLESS mux command，通过 `SessionPool<VlessCoolSession>` 承载逻辑 TCP 与 XUDP 子连接，上限同为两条 active carrier × 128。一个有序 writer 串行化所有子帧并保留取消时的 commitment；reader dispatch 不允许慢 TCP 子流阻塞兄弟。session id 单调且永不复用，因此发出 128 个 id 后 carrier 进入 draining，并可在活动子连接结束前与 replacement 重叠。XUDP record 保留变化的回包地址，支持 full-cone UDP。不入池的 `xudp` 使用相同 frame codec 与保留 id 0，packet 上限为 7,526 字节；池化 Mux.Cool 最多接收 8 KiB。
+
+generation-pinned TCP/UDP、Selector warm-up 与 UDP warm-up 共用所选 H2MUX 或 Mux.Cool pool。冷 speculative 拨号占 provisional pool slot：loser 永不发布，winner 在 endpoint 发布前只 commit 一次。未变 generation 在 reload 时转移 live pool；最后一个所有者消失时只排干可复用状态，不切断活动子连接。两条可复用或正在拨号的 carrier 是饱和 backpressure 上限；只有仍有活动子连接的 draining carrier 可与 replacement 重叠。不存在运行时探测、fallback 或首包重放。所有非 `legacy` 模式都拒绝 VLESS Encryption；`flow=xtls-rprx-vision` 只允许 `legacy` 与 Single `xudp`。
+
+### VLESS Encryption
+
+`honk-outbound/src/proxy/vless_encryption.rs` 在普通 VLESS 请求写入前，先包裹已选定的 VLESS transport。握手可认证 X25519 和/或 ML-KEM-768 服务端密钥（含链式 relay key），每连接执行新的 ML-KEM-768 + X25519 交换，再通过 Xray 的字节 context BLAKE3 KDF 派生双向 AES-256-GCM 或 ChaCha20-Poly1305 record key。`0rtt` 配置按节点缓存服务端 ticket 与 PFS key；冷缓存或过期缓存走 1-RTT。`native`、`xorpub`、`random` 三种流量形态共用同一 codec，其中 `random` 还会掩码每个 record header。handler 拒绝 VLESS Encryption 与 `xtls-rprx-vision` 组合，因为二者都会接管内层 stream framing。
 
 ### REALITY 客户端
 
@@ -359,7 +404,7 @@ counter 之间的不变量。
 
 当 `experimental.clash_api.external_controller` 非空时启用。
 
-核心接口：`/version`、`/configs`、`/proxies`、delay、`/rules`、`/connections`、`/traffic`、`/stats`、`/logs`、`/dns/query`、缓存清理、`/providers/proxies`、外部 UI 自动下载（Yacd-meta）。`GET /stats` 含稳定的嵌套 `udp` 对象；完整 schema 见组件参考。
+核心接口：`/version`、`/configs`、`/proxies`、delay、`/rules`、`/connections`、`/traffic`、`/stats`、`/logs`、`/dns/query`、缓存清理、`/providers/proxies`、外部 UI 自动下载（Yacd-meta）。`GET /stats` 的 `udp.nfqueue` 对象包含队列压力、verdict、token 与 receipt-to-verdict 指标；完整 schema 见组件参考。
 
 鉴权：`Authorization: Bearer` 或 `?token=`（已做 percent-decode）。
 
@@ -368,12 +413,14 @@ counter 之间的不变量。
 - 真实 eBPF 需要 **root**：加载 BPF、TC/cgroup/sk_lookup 挂载、netns、veth、透明 bind、sysctl。
 - Docker：`--privileged --network=host --pid=host`，并挂载 `/sys`。
 - 测试使用 `MockEbpfBackend` / `--mock-ebpf`，无需特权。
+- 启用 `experimental.udp_nfqueue` 还必须使用真实 eBPF 后端；启动会拒绝 mock/无 `ebpf` 的配置，修改该设置后必须重启。
 
 ## 12. 安全注意
 
 - 配置文件与 BPF 目标文件视为**特权输入**。
 - Clash API **无 TLS**；请绑定本机或前置反向代理，并设置强 `secret`。
 - 控制面拨号套接字必须保留 bypass mark，否则网关会把自己的流量再次代理形成环路。
+- 启用 UDP NFQUEUE 时，honk 独占名称精确为 `inet honk_nfqueue` / `udp_decision` 的 nftables 对象；运行期间，同一网络命名空间中的防火墙管理器不得修改它们。
 
 ## 13. 作者与分工说明
 

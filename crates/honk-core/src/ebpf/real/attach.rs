@@ -94,20 +94,31 @@ impl RealEbpfBackend {
             "PARAM: port={} dae0_ifindex={} wan_ifindex={} (iface={})",
             tproxy_port, dae0_ifindex, wan_ifindex, ebpf_wan_ifname
         );
-        // A stale pin must never hide the map owned by this generation.
-        // The singleton lock guarantees the previous engine has exited.
+        std::fs::create_dir_all(pin_root)?;
+        let sequence_pin = pin_root.join(UDP_DECISION_SEQUENCE_MAP);
+        if sequence_pin.try_exists()? {
+            syscall::validate_pinned_udp_decision_sequence(&sequence_pin)?;
+        }
+
+        // A stale pin must never hide a generation-owned map. The token
+        // allocator is the sole exception because token reuse is forbidden.
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
-        let mut bpf = EbpfLoader::new()
+        let mut loader = EbpfLoader::new();
+        loader
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
-            .load(obj)?;
-        std::fs::create_dir_all(pin_root)?;
+            .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
+        let mut bpf = loader.load(obj)?;
+        syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         for (name, map) in bpf.maps() {
             // aya exposes ELF internal sections (.rodata, .bss, etc.) as maps.
             // These cannot be pinned to bpffs; skip them to avoid noisy warnings.
             if name.starts_with('.') {
                 debug!("skipping internal map '{}'", name);
+                continue;
+            }
+            if name == UDP_DECISION_SEQUENCE_MAP {
                 continue;
             }
             let pin_path = pin_root.join(name);
@@ -615,12 +626,24 @@ impl RealEbpfBackend {
     }
 
     /// Determine whether an interface carries Ethernet frames (ARPHRD_ETHER).
-    /// Non-Ethernet interfaces (e.g. loopback, tunnel) should use L3 TC programs.
+    /// `getifaddrs` covers private network namespaces whose `/sys` mount still
+    /// reflects the parent namespace.
     fn iface_is_ethernet(iface: &str) -> bool {
-        std::fs::read_to_string(format!("/sys/class/net/{}/type", iface))
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/type"))
             .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .map(|t| t == 1) // ARPHRD_ETHER
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map(|kind| kind == libc::ARPHRD_ETHER as u32)
+            .or_else(|| {
+                nix::ifaddrs::getifaddrs().ok()?.find_map(|entry| {
+                    if entry.interface_name != iface {
+                        return None;
+                    }
+                    entry
+                        .address?
+                        .as_link_addr()
+                        .map(|address| address.hatype() == libc::ARPHRD_ETHER)
+                })
+            })
             .unwrap_or(false)
     }
 

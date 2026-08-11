@@ -561,6 +561,27 @@ impl Config {
                 default_tproxy_mark()
             )));
         }
+        let reserved = crate::routing::DATAPATH_RESERVED_MARK_MASK;
+        if self.global.so_mark_from_dae & reserved != 0 {
+            return Err(crate::ConfigError::Validation(format!(
+                "global.so_mark_from_dae ({:#x}) overlaps datapath-reserved skb mark bits {reserved:#x}",
+                self.global.so_mark_from_dae
+            )));
+        }
+        for (index, rule) in self.routing.rules.iter().enumerate() {
+            if rule.mark & reserved == 0 {
+                continue;
+            }
+            let rule_name = if rule.name.is_empty() {
+                format!("routing.rules[{index}].mark")
+            } else {
+                format!("routing rule '{}'.mark", rule.name)
+            };
+            return Err(crate::ConfigError::Validation(format!(
+                "{rule_name} ({:#x}) overlaps datapath-reserved skb mark bits {reserved:#x}",
+                rule.mark
+            )));
+        }
         // Content-derived IDs collide when two nodes share protocol, server,
         // and credentials — they are the same endpoint and cannot coexist
         // in the runtime registry.
@@ -616,6 +637,19 @@ impl Config {
                     )));
                 }
             }
+            if node.protocol == crate::types::NodeProtocol::VLess
+                && node
+                    .encryption
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value != "none")
+                && node.flow.as_deref().is_some_and(|flow| !flow.is_empty())
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Node '{}' combines VLESS Encryption with flow; this combination is unsupported",
+                    node.name
+                )));
+            }
+            node.validate_vless_mode()?;
             // direct/block are the injected built-ins; a user node may
             // neither take their names nor their protocols.
             if matches!(
@@ -688,6 +722,33 @@ mod builtin_nodes_tests {
     }
 
     #[test]
+    fn test_validate_rejects_datapath_reserved_routing_marks() {
+        let mut config = Config::default();
+        config.routing.rules.push(crate::routing::RoutingRule {
+            name: "reserved-mark".into(),
+            condition: crate::routing::RoutingCondition::default(),
+            outbound: crate::routing::RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        });
+
+        for reserved_bit in [0x4000_0000, 0x8000_0000] {
+            config.routing.rules[0].mark = reserved_bit;
+            let error = config
+                .validate()
+                .expect_err("reserved routing mark must fail");
+            assert!(error.to_string().contains("reserved skb mark"), "{error}");
+        }
+
+        config.routing.rules[0].mark = 0x3fff_ffff;
+        config.global.so_mark_from_dae = 0x8000_0000;
+        assert!(config.validate().is_err());
+        config.global.so_mark_from_dae = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_rejects_unknown_transport() {
         let mut config = Config::default();
         config.nodes.push(crate::node::Node {
@@ -705,6 +766,60 @@ mod builtin_nodes_tests {
             config.nodes[0].transport = ok.into();
             assert!(config.validate().is_ok(), "transport '{ok}' must pass");
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_vless_mode_conflicts() {
+        let base = crate::node::Node::from_share_link(
+            "vless://uuid@example.com:443?vless_mode=h2mux#vless",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.nodes.push(base.clone());
+        assert!(config.validate().is_ok());
+
+        for mode in [
+            crate::node::WireMode::UotV2,
+            crate::node::WireMode::H2mux,
+            crate::node::WireMode::H2muxPadded,
+            crate::node::WireMode::MuxCool,
+        ] {
+            config.nodes[0] = base.clone();
+            config.nodes[0].vless_mode = mode;
+            config.nodes[0].flow = Some("xtls-rprx-vision".into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("with flow")
+            );
+        }
+        config.nodes[0] = base.clone();
+        config.nodes[0].vless_mode = crate::node::WireMode::Xudp;
+        config.nodes[0].flow = Some("xtls-rprx-vision".into());
+        assert!(config.validate().is_ok());
+
+        config.nodes[0] = base.clone();
+        config.nodes[0].encryption = Some("mlkem768x25519plus.native.1rtt.key".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("with VLESS Encryption")
+        );
+
+        config.nodes[0] = base;
+        config.nodes[0].protocol = crate::types::NodeProtocol::Trojan;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-VLESS protocol")
+        );
     }
 
     #[test]

@@ -8,7 +8,6 @@
 //! 5. TCP relay
 //! 6. DNS resolution
 //! 7. Statistics tracking
-//! 8. Control plane commands
 //!
 //! All tests use the mock eBPF backend, so they run without
 //! kernel eBPF support.
@@ -17,7 +16,7 @@
 mod integration_tests {
     use honk_config::*;
     use honk_core::{
-        control::{ControlCommand, ControlPlane},
+        control::ControlPlane,
         dns::{self, DnsResolver},
         ebpf::mock::MockEbpfBackend,
         proxy::ProxyRegistry,
@@ -61,7 +60,6 @@ mod integration_tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc;
 
     /// Spawn an echo server that returns what it receives.
     async fn spawn_echo_server() -> SocketAddr {
@@ -584,32 +582,6 @@ protocol = "udp"
     }
 
     #[tokio::test]
-    async fn test_control_plane_stats_command() {
-        let config = Config::default();
-        let ebpf = Box::new(MockEbpfBackend::new());
-        let router = Router::new(&[], "direct").unwrap();
-        let registry = ProxyRegistry::default_resolver().unwrap();
-        let resolver = DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap();
-
-        let cp = ControlPlane::new(
-            config,
-            ebpf,
-            router,
-            std::sync::Arc::new(registry),
-            resolver,
-            test_dns_forwarder(),
-        )
-        .unwrap();
-        let tx = cp.command_sender();
-
-        let (stats_tx, _stats_rx) = mpsc::channel(1);
-        tx.send(ControlCommand::GetStats(stats_tx)).await.unwrap();
-
-        // Note: stats response requires the event loop to be running
-        // This test just verifies the channel works
-    }
-
-    #[tokio::test]
     async fn test_reload_rebuilds_group_manager_preserving_choices() {
         use honk_config::group::{Group, GroupPolicy};
         use honk_config::node::Node;
@@ -770,7 +742,7 @@ protocol = "udp"
         }];
         let rules = config.routing.rules.clone();
 
-        let cp = ControlPlane::new(
+        let mut cp = ControlPlane::new(
             config,
             Box::new(MockEbpfBackend::new()),
             Router::new(&rules, "direct").unwrap(),
@@ -779,6 +751,15 @@ protocol = "udp"
             test_dns_forwarder(),
         )
         .unwrap();
+        cp.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
+            honk_core::mode::ModeState::new("Rule", "Proxy"),
+        )));
+        cp.start_datapath_flags_coordinator().unwrap();
+        cp.datapath_flags_handle()
+            .unwrap()
+            .initialize(0, false, false)
+            .await
+            .unwrap();
 
         // Simulate a late subscription fetch completing: two new nodes with
         // fresh UUIDs replace the previous generation.

@@ -1,4 +1,3 @@
-mod section_parser;
 #[cfg(test)]
 mod tests;
 
@@ -14,7 +13,11 @@ use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
 use regex::Regex;
-use section_parser::Section;
+#[derive(Debug, Clone)]
+struct Section {
+    name: String,
+    body: String,
+}
 
 /// Load a dae configuration file, resolving its top-level `include` blocks.
 ///
@@ -655,12 +658,6 @@ fn split_sections(input: &str) -> Result<Vec<Section>, crate::ConfigError> {
             } else {
                 current_body.push_str(trimmed);
                 current_body.push('\n');
-                for _ in 0..close_count {
-                    current_body.push('}');
-                }
-                if close_count > 0 {
-                    current_body.push('\n');
-                }
             }
         }
     }
@@ -1524,6 +1521,10 @@ fn parse_ip_args(args: &[String], cond: &mut crate::routing::ConditionFields<'_>
     }
 }
 
+fn node_parse_diagnostic(error: &crate::ConfigError) -> String {
+    format!("node section: skipping unparseable entry: {error}")
+}
+
 fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError> {
     let mut nodes = Vec::new();
     for line in section.body.lines() {
@@ -1535,7 +1536,7 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
             && rest.trim_start().starts_with(['=', ':'])
         {
             return Err(crate::ConfigError::Parse(
-                "node section: 'mux' (h2mux) is no longer supported; remove the mux setting".into(),
+                "node section: standalone 'mux' is unsupported; set vless_mode on each VLESS share link".into(),
             ));
         }
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
@@ -1575,9 +1576,7 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
             // A recognized-but-removed protocol in the config file is a hard
             // error (subscriptions skip such entries with a warning instead).
             Err(e @ crate::ConfigError::UnknownProtocol(_)) => return Err(e),
-            Err(e) => {
-                eprintln!("node section: skipping unparseable entry '{trimmed}': {e}");
-            }
+            Err(e) => eprintln!("{}", node_parse_diagnostic(&e)),
         }
     }
     Ok(nodes)
@@ -1697,7 +1696,14 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
 
 fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
-    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file"])?;
+    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file", "udp_nfqueue"])?;
+
+    if let Some(unparsed) = subs.first().filter(|sub| !sub.body.trim().is_empty()) {
+        let setting = unparsed.body.lines().next().unwrap_or_default().trim();
+        return Err(crate::ConfigError::Parse(format!(
+            "unknown experimental setting: {setting}"
+        )));
+    }
 
     for sub in &subs {
         let kv = parse_kv_pairs(&sub.body);
@@ -1733,11 +1739,32 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                     cfg.cache_file.store_dns = parse_bool(v);
                 }
             }
+            "udp_nfqueue" => {
+                if let Some(key) = kv.keys().find(|key| key.as_str() != "enabled") {
+                    return Err(crate::ConfigError::Parse(format!(
+                        "unknown experimental.udp_nfqueue setting: {key}"
+                    )));
+                }
+                if let Some(v) = kv.get("enabled") {
+                    cfg.udp_nfqueue.enabled =
+                        parse_checked_bool(v, "experimental.udp_nfqueue.enabled")?;
+                }
+            }
             _ => {}
         }
     }
 
     Ok(cfg)
+}
+
+fn parse_checked_bool(s: &str, setting: &str) -> Result<bool, crate::ConfigError> {
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" => Ok(true),
+        "false" | "no" | "0" | "off" => Ok(false),
+        _ => Err(crate::ConfigError::Parse(format!(
+            "invalid boolean for {setting}: {s}"
+        ))),
+    }
 }
 
 fn parse_bool(s: &str) -> bool {

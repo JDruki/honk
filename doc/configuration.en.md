@@ -66,7 +66,7 @@ group { ... }          # selection policies over nodes / nested groups
 routing { ... }        # ordered traffic rules + fallback outbound
 dns { ... }            # upstreams, DNS routing, cache
 subscription { ... }   # remote node lists
-experimental { ... }   # clash_api, cache_file
+experimental { ... }   # clash_api, cache_file, udp_nfqueue
 ```
 
 Built-ins:
@@ -178,6 +178,9 @@ experimental {
         path: 'cache.db'
         store_dns: true
     }
+    udp_nfqueue {
+        enabled: false
+    }
 }
 ```
 
@@ -222,10 +225,10 @@ configured groups or explicit budgets rather than raw subscription size:
 
 | Mechanism | Key | Default | Notes |
 | ----------- | ----- | --------- | ------- |
-| Bare TCP preconnect at startup | `preconnect_node_count` | `'auto'` | One startup pass only. `'auto'` tries up to 8 nodes (each group's current pick first, then config order); `0` disables; explicit `N` may cover all eligible nodes with at most 8 concurrent attempts. Only bare-TCP-poolable protocols qualify — AnyTLS/QUIC and the built-in `direct`/`block` are always skipped. |
-| Selector pin | — | always on | Keeps the configured leaf of every `selector` group warm, including an explicitly selected node while it is unhealthy. AnyTLS and QUIC protocols retain their reusable session/client; other proxy protocols retain one bare server TCP connection. A Clash API choice change wakes reconciliation immediately, releases the previous leaf without cutting active flows, and warms the replacement. Reload preserves ownership for unchanged selected nodes. |
-| UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, dispatches at most 4 attempts concurrently, and caps the process-wide retained set at `4×N`. UDP and Selector ownership are independent: a shared resource is released only after both reasons disappear. |
-| Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and protocol handshakes per generation. Ready-pool hits, logical streams on warm AnyTLS/QUIC transports, and built-in `direct`/`block` dials are exempt. Reload changes the replacement's local limit, while old and new generations share one immutable startup descriptor gate. |
+| Bare TCP preconnect at startup | `preconnect_node_count` | `'auto'` | One startup pass only. `'auto'` tries up to 8 nodes (each group's current pick first, then config order); `0` disables; explicit `N` may cover all eligible nodes with at most 8 concurrent attempts. Only bare-TCP-poolable protocols qualify — AnyTLS, VLESS H2MUX/Mux.Cool, QUIC, and the built-in `direct`/`block` are always skipped. |
+| Selector pin | — | always on | Keeps the configured leaf of every `selector` group warm, including an explicitly selected node while it is unhealthy. AnyTLS, VLESS H2MUX, and VLESS Mux.Cool retain a reusable session; QUIC protocols retain their client; other proxy protocols retain one bare server TCP connection. A Clash API choice change wakes reconciliation immediately, releases the previous leaf without cutting active flows, and warms the replacement. Reload preserves ownership for unchanged selected nodes. |
+| UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, dispatches at most 4 attempts concurrently, and caps the process-wide retained set at `4×N`. Reusable VLESS H2MUX/Mux.Cool state participates. UDP and Selector ownership are independent: a shared resource is released only after both reasons disappear. |
+| Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and protocol handshakes per generation. Ready-pool hits, logical streams on warm AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/QUIC transports, and built-in `direct`/`block` dials are exempt. Reload changes the replacement's local limit, while old and new generations share one immutable startup descriptor gate. |
 
 Health checks probe but never warm a cold node, so `check_interval` on a
 400-node subscription does not create 400 idle tunnels. The Selector pin is
@@ -245,7 +248,9 @@ node {
 
 Supported schemes (parser): `ss://`, `socks5://`, `trojan://`, `vmess://`, `vless://`, `hysteria2://`, `tuic://`, `juicity://`, `anytls://`.
 
-Node parameters (credentials, `sni`, transport/ws/grpc options, protocol-specific Hy2/TUIC/Juicity/AnyTLS options) are carried by the share link's userinfo/host/query components — the same fields the `Node` model exposes (`name`, `protocol`, `address`/`host`, `port`, `password`/`username`, `encryption`, `tls`, `sni`, `transport`, `ws_path`, `ws_host`, `grpc_service`, ...). An explicit `tag:` prefix overrides the name embedded in the link.
+Node parameters (credentials, `sni`, transport/ws/grpc options, protocol-specific Hy2/TUIC/Juicity/AnyTLS options) are carried by the share link's userinfo/host/query components — the same fields the `Node` model exposes (`name`, `protocol`, `address`/`host`, `port`, `password`/`username`, `encryption`, `vless_mode`, `tls`, `sni`, `transport`, `ws_path`, `ws_host`, `grpc_service`, ...). An explicit `tag:` prefix overrides the name embedded in the link.
+
+VLESS uses the canonical share-link query `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`; omission means `legacy`. The modes select legacy TCP/no UDP, direct UoT v2, sing-box H2MUX with optional padding, Xray Single XUDP, or pooled Xray Mux.Cool. They are never negotiated or downgraded. Every non-legacy mode rejects VLESS Encryption; only `xudp` may combine with `flow=xtls-rprx-vision`. See the component reference for the complete wire and subscription-import contract.
 
 See [components.en.md](./components.en.md) for the full field table and protocol notes (including UDP support matrix).
 
@@ -521,7 +526,7 @@ Each entry is `tag: 'url'` (a bare quoted URL is also accepted). In dae syntax t
 - Share links inside the body are parsed by `Node::from_share_link`.
 
 Clash YAML VLESS entries map `uuid` (with legacy `password` fallback),
-`servername` (with `sni` fallback), `flow`, and `network` before deriving the
+`encryption`, `servername` (with `sni` fallback), `flow`, and `network` before deriving the
 node ID. Nested `reality-opts` maps `public-key`, `short-id`, and `spider-x`
 (default `/`) and enables the REALITY TLS carrier; nested `ws-opts` maps
 `path` plus a case-insensitive `headers.Host`, and `grpc-opts` maps
@@ -530,12 +535,95 @@ entry with `reality-opts` but no non-empty `public-key` is skipped instead of
 falling back to ordinary TLS. Clash `client-fingerprint` is intentionally
 unmapped because honk selects the fingerprint process-wide.
 
+Enabled Clash `smux`/`multiplex` with protocol `h2mux`, or with no protocol but
+an explicit `padding` boolean, maps to `h2mux` or `h2mux-padded`; an enabled
+block missing both discriminators is rejected. Enabled `udp-over-tcp` version
+0/2 maps to `uot-v2`; `packet-encoding: xudp` or `xudp: true` maps to Single
+`xudp`. Conflicting mode representations, enabled packetaddr, unsupported mux
+protocols/tuning, or `udp: true` without an explicit packet mode reject the
+entry. `mux-cool` is available only through the canonical share-link mode.
+
 The supported VLESS transport shapes are plain/TLS/REALITY over TCP, WS, or
 gRPC, except that `xtls-rprx-vision` requires TLS or REALITY and TCP. Other
 transports and flows are parsed for visibility but are not dialed by
-`honk-tool sub`; VLESS has no UDP packet handler.
+`honk-tool sub`. Legacy VLESS and nodes whose `network` excludes UDP render it
+as `n/a`; every non-legacy mode otherwise runs the UDP probes through its
+packet transport.
 
 ## 11. Experimental
+
+### Held-first-packet UDP NFQUEUE
+
+```dae
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
+
+`enabled` is the only setting and defaults to `false`. Changing
+`experimental.udp_nfqueue.enabled` is restart-required; a SIGHUP reload rejects
+the change. Enabled startup requires a build with the `ebpf` feature and the
+real eBPF backend. A build without `ebpf` or a run with `--mock-ebpf` is rejected
+at startup rather than silently falling back.
+
+This path covers **LAN-forwarded UDP only**: host `inet prerouting` follows the
+LAN TC staging point, while host-originated WAN egress remains on the canonical
+TPROXY path. Port 53, internal/special traffic, `must`, `block`, reverse traffic,
+and already-safe route-time direct decisions are excluded. Only an ambiguous
+decision that may still change after userspace routing or domain/QUIC inspection
+is staged.
+
+honk binds one raw-netlink NFQUEUE, fixed queue `320`, with no bypass, fanout, or
+fail-open mode. It owns the exact nftables table and chain names
+`inet honk_nfqueue` / `udp_decision`. A firewall manager in the same network
+namespace must not flush, replace, or mutate either object while honk is running.
+The eBPF `UDP_DECISION_SEQUENCE` pin is persistent across ordinary restart and
+cleanup. Tokens combine a two-bit generation and a 28-bit sequence. The pin
+keeps the legacy 12-byte layout and stores the full raw token in `next`; startup
+validates but does not rewrite it, so the previous binary can resume from the
+same boundary after a rollback without token reuse. Preserve this pin for normal
+upgrade and downgrade. If startup rejects a corrupt or incompatible pin, keep
+NFQUEUE fenced, stop every honk process, verify the queue and token-bound maps
+are gone, then remove the pin once before restarting; deleting it while a queue
+or token-bound map is live can reuse an active token. Exhaustion fences and
+drains staging before switching only when the candidate generation and every
+higher generation through 3 are absent from every live token-bound map. A
+rolled-back legacy allocator can advance only through that range, so this
+prevents reuse. If no such candidate is clear, retries back off through 1, 2,
+5, then 30 seconds;
+non-staged UDP continues while ambiguous new flows fail closed. No reboot or
+manual reset is required during normal operation.
+
+The original skb is held before conntrack/NAT. Direct performs token-checked
+Arm → FIFO `NF_ACCEPT` with the final mark → Activate, without a userspace direct
+socket, payload copy, endpoint, connection entry, or deliberate retransmission.
+Proxy commits token-bound state, transfers the one retained payload copy into
+the existing UDP initializer, drops the original skb(s), and dials/sends once.
+Block and cancellation drop the originals. Reload and shutdown clear readiness,
+quiesce/cancel pending ownership, and only then tear down the queue and owned
+table. Queue/listener/verdict errors remain fatal rather than fail-open;
+allocator exhaustion uses fenced generation rotation.
+
+The ingest actor admits at most 256 packets and 8 MiB of retained payload. A
+typical 1,200-byte workload reaches the entry cap first; maximum 65,507-byte UDP
+payloads reach the byte cap at 128 queued packets. The correlator additionally
+caps live flow cells at 4,096 and held verdicts at 64 per flow. Slow-path permits
+are acquired when the actor dequeues, not while requests wait in the actor queue.
+The absolute hold deadline is three seconds from listener receipt and includes
+backend-lock acquisition before Arm and the post-Arm Activate acquisition. Full
+or expired work is dropped rather than allowed to grow memory or bypass policy.
+
+With the Clash API enabled, `GET /stats` exposes the fixed object
+`/stats.udp.nfqueue` (dotted path, not a separate route): `received`,
+`activeFlows`, `kernelQueueDepth`, `kernelStatsAvailable`,
+`kernelStatsReadErrors`, `kernelDropped`, `kernelUserDropped`, `heldPackets`,
+`heldPeak`, `socketReceiveBufferBytes`, `actorQueueFull`, `correlatorFull`,
+`actorQueueDepth`, `actorQueuedBytes`, `actorOldestAgeNanos`, `directAccepted`,
+`proxyCopied`, `proxyDropped`, `block`, `cancel`, `drop`, `tokenMismatch`,
+`tokenExhaustion`, `tokenRollovers`, `verdictErrors`, and `receiptToVerdict`. See
+the component reference for field meanings.
 
 ### Clash API
 
@@ -605,7 +693,8 @@ Subcommands: `mode`, `proxy`, `delay` (see [components.en.md](./components.en.md
 2. Ensure every `routing` fallback / rule target, `dns` fallback, and group `final:` name refers to a real group, node, `direct`, or `block`.
 3. For domain rules on first connection, use `dial_mode: domain` / `domain++` or ensure DNS goes through honk so domain bitmaps fill.
 4. After changing groups/policies, reload (SIGHUP) rebuilds `GroupManager`; selector choices migrate when still valid.
-5. Run `cargo test -p honk-config` to ensure examples still parse if you add fixtures.
+5. Changing `experimental.udp_nfqueue.enabled` requires a process restart; verify that an enabled deployment uses the real eBPF backend and that its firewall manager leaves `inet honk_nfqueue` / `udp_decision` alone.
+6. Run `cargo test -p honk-config` to ensure examples still parse if you add fixtures.
 
 ## 14. Related docs
 

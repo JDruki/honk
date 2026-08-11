@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "crates/honk-config",
     "crates/honk-ebpf-common",
+    "crates/honk-nfqueue",
     "crates/honk-outbound",
     "crates/honk-core",
     "crates/honk-tool",
@@ -21,6 +22,7 @@ authors = ["glassyiris <honk@catmint.cc> and honk contributors"]
 # Internal
 honk-config = { path = "crates/honk-config" }
 honk-ebpf-common = { path = "crates/honk-ebpf-common" }
+honk-nfqueue = { path = "crates/honk-nfqueue" }
 honk-outbound = { path = "crates/honk-outbound" }
 
 # Async runtime
@@ -38,7 +40,6 @@ toml = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-log = "0.4"
 
 # Error handling
 thiserror = "2"
@@ -123,7 +124,6 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # Dev/test utilities
 tempfile = "3"
-tokio-test = "0.4"
 rcgen = "0.14"
 
 [profile.release]
@@ -132,8 +132,8 @@ lto = true
 codegen-units = 1
 strip = true
 
-# Keep the shipping profile size-oriented; opt-in profiles isolate LLVM
-# optimization and LTO effects for controlled benchmarks.
+# Keep the shipping profile size-oriented; opt-in profiles isolate LTO effects
+# for controlled benchmarks.
 [profile.release-size]
 inherits = "release"
 opt-level = "s"
@@ -144,20 +144,6 @@ strip = true
 [profile.release-size-thin]
 inherits = "release"
 opt-level = "s"
-lto = "thin"
-codegen-units = 1
-strip = true
-
-[profile.release-speed]
-inherits = "release"
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
-
-[profile.release-speed-thin]
-inherits = "release"
-opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true

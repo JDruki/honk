@@ -57,7 +57,7 @@ group          # 节点/嵌套组的选择策略
 routing        # 有序流量规则 + fallback
 dns            # 上游、DNS 路由、缓存
 subscription   # 远程节点列表
-experimental   # clash_api、cache_file
+experimental   # clash_api、cache_file、udp_nfqueue
 ```
 
 内置：
@@ -157,6 +157,9 @@ experimental {
         path: 'cache.db'
         store_dns: true
     }
+    udp_nfqueue {
+        enabled: false
+    }
 }
 ```
 
@@ -200,10 +203,10 @@ honk 有三套互相独立的预热机制。其上限由已配置的组或显式
 
 | 机制 | 配置项 | 默认 | 说明 |
 | ------ | -------- | ------ | ------ |
-| 启动裸 TCP 预连接 | `preconnect_node_count` | `'auto'` | 只在启动时执行一轮。`'auto'` 最多尝试 8 个节点（各组当前选中优先，其次配置顺序）；`0` 关闭；显式 `N` 可覆盖全部合格节点，但最多 8 个并发尝试。仅可裸 TCP 池化的协议参与——AnyTLS/QUIC 与内置 `direct`/`block` 一律跳过。 |
-| Selector 常驻 | — | 始终启用 | 每个 `selector` 组按配置选中的叶节点都会保持热态；即使显式选中的节点暂时不健康，也不会改暖其他节点。AnyTLS 与 QUIC 协议保留可复用 session/client，其他代理协议保留一条到服务端的裸 TCP。Clash API 切换选择会立即唤醒协调器：不打断活动流，释放旧节点的 warm 所有权并预热新节点。reload 时未变的已选节点延续原资源。 |
-| UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每 IP 族取 top `min(N,3)` 个 UDP 叶子，最多并发 4 个尝试，进程级驻留总量封顶为 `4×N`。UDP 与 Selector 是独立所有者；只有两种原因都消失时才释放共享资源。 |
-| 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制物理代理连接和协议握手；Ready 池命中、已热 AnyTLS/QUIC transport 的逻辑流及内置 `direct`/`block` 均不占额度。reload 会更新 replacement 的局部上限，但新旧 generation 始终共享启动时确定的同一个描述符 gate。 |
+| 启动裸 TCP 预连接 | `preconnect_node_count` | `'auto'` | 只在启动时执行一轮。`'auto'` 最多尝试 8 个节点（各组当前选中优先，其次配置顺序）；`0` 关闭；显式 `N` 可覆盖全部合格节点，但最多 8 个并发尝试。仅可裸 TCP 池化的协议参与——AnyTLS、VLESS H2MUX/Mux.Cool、QUIC 与内置 `direct`/`block` 一律跳过。 |
+| Selector 常驻 | — | 始终启用 | 每个 `selector` 组按配置选中的叶节点都会保持热态；即使显式选中的节点暂时不健康，也不会改暖其他节点。AnyTLS、VLESS H2MUX 与 VLESS Mux.Cool 保留可复用 session，QUIC 协议保留 client，其他代理协议保留一条到服务端的裸 TCP。Clash API 切换选择会立即唤醒协调器：不打断活动流，释放旧节点的 warm 所有权并预热新节点。reload 时未变的已选节点延续原资源。 |
+| UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每 IP 族取 top `min(N,3)` 个 UDP 叶子，最多并发 4 个尝试，进程级驻留总量封顶为 `4×N`；可复用的 VLESS H2MUX/Mux.Cool 状态会参与。UDP 与 Selector 是独立所有者；只有两种原因都消失时才释放共享资源。 |
+| 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制物理代理连接和协议握手；Ready 池命中、已热 AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/QUIC transport 上的逻辑流及内置 `direct`/`block` 均不占额度。reload 会更新 replacement 的局部上限，但新旧 generation 始终共享启动时确定的同一个描述符 gate。 |
 
 健康探测不会把冷节点变热，因此 400 节点订阅不会因 `check_interval`
 常驻 400 条隧道。Selector 常驻另以 10 秒周期作丢失资源的兜底修复。
@@ -215,7 +218,9 @@ honk 有三套互相独立的预热机制。其上限由已配置的组或显式
 
 解析支持的 scheme：`ss://`、`socks5://`、`trojan://`、`vmess://`、`vless://`、`hysteria2://`、`tuic://`、`juicity://`、`anytls://`。
 
-分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
+分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`vless_mode`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
+
+VLESS 使用规范分享链接 query `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`，省略时为 `legacy`。这些模式分别选择旧 TCP/无 UDP、直连 UoT v2、sing-box H2MUX（可带 padding）、Xray Single XUDP 或池化 Xray Mux.Cool；不会协商或降级。所有非 `legacy` 模式都拒绝 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。完整 wire 与订阅导入约束见组件参考。
 
 完整字段表与协议注意点（含 UDP 支持矩阵）见 [components.zh.md](./components.zh.md)。
 
@@ -459,7 +464,7 @@ dae 语法仅支持 `tag: 'url'` 形式；`sub_type`（simple | clash | sip008 |
 - 正文中的分享链接由 `Node::from_share_link` 解析。
 
 Clash YAML 的 VLESS 条目会在派生节点 ID 前映射 `uuid`（兼容旧
-`password`）、`servername`（回退到 `sni`）、`flow` 与 `network`。嵌套
+`password`）、`encryption`、`servername`（回退到 `sni`）、`flow` 与 `network`。嵌套
 `reality-opts` 映射 `public-key`、`short-id`、`spider-x`（缺省 `/`）并启用
 REALITY TLS 承载；嵌套 `ws-opts` 映射 `path` 及大小写不敏感的
 `headers.Host`，`grpc-opts` 映射 `grpc-service-name`。原有扁平 WS/gRPC
@@ -467,12 +472,78 @@ REALITY TLS 承载；嵌套 `ws-opts` 映射 `path` 及大小写不敏感的
 该条目会被跳过，不会静默降级成普通 TLS。Clash `client-fingerprint`
 不映射，因为 honk 的指纹选择是进程级而非节点级。
 
+已启用且协议为 `h2mux`，或未写协议但显式提供 `padding` 布尔值的 Clash
+`smux`/`multiplex` 会映射为 `h2mux` 或 `h2mux-padded`；两个判别字段都缺失的
+已启用配置会被拒绝。已启用的 `udp-over-tcp` 版本 0/2 映射为 `uot-v2`；
+`packet-encoding: xudp` 或 `xudp: true` 映射为 Single `xudp`。冲突的模式表示、
+启用的 packetaddr、不支持的 mux 协议/调优，以及没有显式 packet mode 的
+`udp: true` 都会拒绝该条目。`mux-cool` 仅能通过规范分享链接模式启用。
+
 VLESS 支持 plain/TLS/REALITY 承载上的 TCP、WS、gRPC；其中
 `xtls-rprx-vision` 必须使用 TLS 或 REALITY，且仅支持 TCP。其他 transport
-与 flow 只保留用于可见性，`honk-tool sub` 不会拨号；VLESS 没有 UDP
-packet handler。
+与 flow 只保留用于可见性，`honk-tool sub` 不会拨号。Legacy VLESS 以及
+`network` 排除 UDP 的节点会把 UDP 显示为 `n/a`；其他所有非 `legacy`
+模式会通过各自 packet transport 执行 UDP 探测。
 
 ## 11. Experimental
+
+### 首包保留 UDP NFQUEUE
+
+```dae
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
+
+`enabled` 是唯一设置，默认 `false`。修改
+`experimental.udp_nfqueue.enabled` 后必须重启；SIGHUP 重载会拒绝该变化。
+启用时必须使用带 `ebpf` feature 的构建和真实 eBPF 后端。不带 `ebpf` 的构建或
+使用 `--mock-ebpf` 的运行会在启动时被拒绝，不会静默回退。
+
+该路径**仅覆盖 LAN 转发 UDP**：主机的 `inet prerouting` 位于 LAN TC 暂存点之后；
+本机发起的 WAN 出口流量仍走规范 TPROXY 路径。53 端口、内部/特殊流量、`must`、
+`block`、反向流量以及已经可以安全地在路由时直连的决策均被排除。只有在用户态路由或
+域名/QUIC 检查后仍可能改判的歧义决策才会暂存。
+
+honk 通过 raw netlink 绑定唯一且固定的 NFQUEUE `320`，不启用 bypass、fanout 或
+fail-open。它拥有名称精确为 `inet honk_nfqueue` / `udp_decision` 的 nftables 表与链。
+honk 运行期间，同一网络命名空间中的防火墙管理器不得 flush、替换或修改任一对象。
+eBPF `UDP_DECISION_SEQUENCE` pin 会跨普通重启和清理保留。token 由两位 generation 与
+28 位 sequence 组成。pin 保留旧版本的 12 字节布局，并在 `next` 中保存完整 raw token；
+启动只校验、不改写，因此回滚到上一 binary 时会从同一边界继续分配而不复用 token。
+正常升级/降级必须保留该 pin。只有启动明确拒绝损坏或不兼容的 pin 时，才应保持
+NFQUEUE fenced，停止所有 honk 进程，确认队列和 token 绑定 map 已消失，再删除一次 pin
+并重启；仍有队列或 token 绑定 map 存活时删除会复用活动 token。耗尽时先 fence 并
+排空暂存；只有候选 generation 及其到 generation 3 的所有更高 generation 都未出现在
+任何存活 token 绑定 map 中，才能切换。旧 allocator 只会沿该区间单调递增，因此回滚
+后不会复用 token。若没有满足条件的候选，则按 1、2、5、30 秒退避重试：无需暂存的
+UDP 继续工作，新的歧义流 fail closed；正常运行无需重启系统或手工重置 allocator。
+
+原始 skb 在 conntrack/NAT 之前被保留。Direct 执行 token 校验的
+Arm → 按 FIFO 以最终 mark `NF_ACCEPT` → Activate，不创建用户态直连 socket、
+payload 副本、endpoint、connection 条目，也不故意触发重传。Proxy 提交 token 绑定
+状态，把唯一的保留 payload 副本转交给现有 UDP 初始化器，丢弃原始 skb，并且只
+拨号/发送一次。Block 和取消会丢弃原始 skb。重载与关闭先清除 readiness，静默并取消
+待定所有权，再拆除队列及自有表。队列、listener 和 verdict 错误仍为致命错误，不会
+fail-open；分配器耗尽使用带 fence 的 generation 轮换恢复。
+
+ingest actor 最多接纳 256 个报文和 8 MiB 保留 payload。典型 1,200 字节负载先达到
+项数上限；65,507 字节的最大 UDP payload 在 128 个排队报文时达到字节上限。
+correlator 另将存活 flow cell 限制为 4,096 个，并将每条流的保留 verdict 限制为 64 个。
+slow-path permit 在 actor 出队时获取，而不是在请求等待队列时预占。绝对保留期限从
+listener 收包起固定为三秒，既包含 Arm 前的 backend 锁获取，也包含 Arm 后 Activate
+的锁获取。队列满或超期时直接丢弃，既不让内存继续增长，也不绕过策略。
+
+启用 Clash API 后，`GET /stats` 暴露固定对象 `/stats.udp.nfqueue`（点路径，不是
+独立路由）：`received`、`activeFlows`、`kernelQueueDepth`、
+`kernelStatsAvailable`、`kernelStatsReadErrors`、`kernelDropped`、
+`kernelUserDropped`、`heldPackets`、`heldPeak`、`socketReceiveBufferBytes`、
+`actorQueueFull`、`correlatorFull`、`actorQueueDepth`、`actorQueuedBytes`、
+`actorOldestAgeNanos`、`directAccepted`、`proxyCopied`、`proxyDropped`、`block`、
+`cancel`、`drop`、`tokenMismatch`、`tokenExhaustion`、`tokenRollovers`、
+`verdictErrors` 和 `receiptToVerdict`。字段含义见组件参考。
 
 ### Clash API
 
@@ -538,7 +609,8 @@ CLI 参数：`--config` / `-c`、`--bpf-object` / `-b`、`--bpf-pin-root`、`--d
 2. 确保 routing / dns / 组的 `final` 中的名称指向真实组、节点、`direct` 或 `block`。
 3. 首连域名规则：使用 `dial_mode: domain` / `domain++`，或让 DNS 走 honk 以填充域名位图。
 4. 修改组/策略后，SIGHUP 重载会重建 `GroupManager`；仍有效的 Selector 选择会迁移。
-5. 若增加示例夹具，可跑 `cargo test -p honk-config` 确认仍能解析。
+5. 修改 `experimental.udp_nfqueue.enabled` 后必须重启进程；启用时应确认使用真实 eBPF 后端，且防火墙管理器不会修改 `inet honk_nfqueue` / `udp_decision`。
+6. 若增加示例夹具，可跑 `cargo test -p honk-config` 确认仍能解析。
 
 ## 14. 相关文档
 

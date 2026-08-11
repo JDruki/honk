@@ -1,17 +1,17 @@
 //! Raw extensions for BPF map commands that Aya 0.14 does not expose.
 //!
 //! Ordinary map reads, writes, deletes, iteration, and per-CPU access use
-//! Aya's typed map APIs in `real::mod`. This module is limited to atomic
-//! lookup-and-delete and Linux batch commands, while retaining Aya `Pod`
-//! bounds so callers cannot pass arbitrary wire layouts.
+//! Aya's typed map APIs in `real::mod`. This module owns the atomic and batch
+//! commands plus locked access to the persistent UDP token allocator.
 
 use super::*;
 
 use aya::Pod;
-use aya_obj::generated::bpf_attr;
 use aya_obj::generated::bpf_cmd::*;
+use aya_obj::generated::{BPF_ANY, BPF_F_LOCK, bpf_attr, bpf_map_info, bpf_map_type};
 use std::ffi::c_long;
 use std::mem::MaybeUninit;
+use std::path::Path;
 
 const ENOENT: c_long = libc::ENOENT as c_long;
 pub const BPF_BATCH_CHUNK: usize = 128;
@@ -83,6 +83,148 @@ fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
     bpf.map(name)
         .map(map_raw_fd)
         .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))
+}
+
+fn raw_map_info(fd: RawFd) -> anyhow::Result<bpf_map_info> {
+    let mut info: bpf_map_info = unsafe { core::mem::zeroed() };
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.info.bpf_fd = fd as u32;
+    attr.info.info_len = core::mem::size_of::<bpf_map_info>() as u32;
+    attr.info.info = (&mut info as *mut bpf_map_info) as u64;
+    unsafe { bpf_syscall(BPF_OBJ_GET_INFO_BY_FD as c_long, &mut attr) }
+        .map_err(|error| anyhow::anyhow!("BPF_OBJ_GET_INFO_BY_FD errno={error}"))?;
+    Ok(info)
+}
+
+fn locked_udp_decision_sequence(fd: RawFd) -> anyhow::Result<UdpDecisionSequence> {
+    let key = 0u32;
+    let mut value = UdpDecisionSequence::default();
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = (&key as *const u32) as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = (&mut value as *mut UdpDecisionSequence) as u64;
+    attr.__bindgen_anon_2.flags = BPF_F_LOCK as u64;
+    unsafe { bpf_syscall(BPF_MAP_LOOKUP_ELEM as c_long, &mut attr) }.map_err(|error| {
+        anyhow::anyhow!(
+            "locked UDP_DECISION_SEQUENCE lookup failed (spin-lock BTF incompatible), errno={error}"
+        )
+    })?;
+    Ok(value)
+}
+
+fn update_locked_udp_decision_sequence(
+    fd: RawFd,
+    value: &UdpDecisionSequence,
+) -> anyhow::Result<()> {
+    let key = 0u32;
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = (&key as *const u32) as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = (value as *const UdpDecisionSequence) as u64;
+    attr.__bindgen_anon_2.flags = (BPF_ANY | BPF_F_LOCK) as u64;
+    unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) }.map_err(|error| {
+        anyhow::anyhow!(
+            "locked UDP_DECISION_SEQUENCE update failed (spin-lock BTF incompatible), errno={error}"
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_udp_decision_sequence_info(info: &bpf_map_info) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        info.type_ == bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+        "UDP_DECISION_SEQUENCE has incompatible map type {}",
+        info.type_
+    );
+    anyhow::ensure!(
+        info.key_size == core::mem::size_of::<u32>() as u32,
+        "UDP_DECISION_SEQUENCE has incompatible key size {}",
+        info.key_size
+    );
+    anyhow::ensure!(
+        info.value_size == core::mem::size_of::<UdpDecisionSequence>() as u32,
+        "UDP_DECISION_SEQUENCE has incompatible value size {}",
+        info.value_size
+    );
+    anyhow::ensure!(
+        info.max_entries == 1,
+        "UDP_DECISION_SEQUENCE has incompatible max_entries {}",
+        info.max_entries
+    );
+    anyhow::ensure!(
+        info.map_flags == 0,
+        "UDP_DECISION_SEQUENCE has incompatible map flags 0x{:x}",
+        info.map_flags
+    );
+    anyhow::ensure!(
+        info.btf_id != 0 && info.btf_value_type_id != 0,
+        "UDP_DECISION_SEQUENCE is missing value BTF"
+    );
+    Ok(())
+}
+
+fn validate_udp_decision_sequence_value(sequence: UdpDecisionSequence) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        sequence.next <= honk_ebpf_common::NFQUEUE_TOKEN_MASK,
+        "UDP_DECISION_SEQUENCE next token exceeds its token space"
+    );
+    anyhow::ensure!(
+        sequence.exhausted <= 1,
+        "UDP_DECISION_SEQUENCE has invalid exhausted flag {}",
+        sequence.exhausted
+    );
+    if sequence.exhausted != 0 {
+        anyhow::ensure!(
+            sequence.next == honk_ebpf_common::NFQUEUE_TOKEN_MASK,
+            "UDP_DECISION_SEQUENCE has an inconsistent exhausted flag"
+        );
+    }
+    Ok(())
+}
+
+fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSequence> {
+    let info = raw_map_info(fd)?;
+    validate_udp_decision_sequence_info(&info)?;
+    let sequence = locked_udp_decision_sequence(fd)?;
+    validate_udp_decision_sequence_value(sequence)?;
+    Ok(sequence)
+}
+
+pub fn validate_pinned_udp_decision_sequence(path: &Path) -> anyhow::Result<()> {
+    let map = aya::maps::MapData::from_pin(path)
+        .map_err(|error| anyhow::anyhow!("open persistent map '{}': {error}", path.display()))?;
+    validate_udp_decision_sequence_fd(map.fd().as_fd().as_raw_fd()).map(|_| ())
+}
+
+pub fn validate_loaded_udp_decision_sequence(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
+    validate_udp_decision_sequence_fd(map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?)
+}
+
+#[cfg(test)]
+pub(super) fn read_udp_decision_sequence_locked(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
+    locked_udp_decision_sequence(map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?)
+}
+
+pub fn reset_udp_decision_sequence_locked(bpf: &Ebpf, generation: u32) -> anyhow::Result<()> {
+    let value = UdpDecisionSequence {
+        next: generation << honk_ebpf_common::UDP_DECISION_GENERATION_SHIFT,
+        ..Default::default()
+    };
+    update_locked_udp_decision_sequence(
+        map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?,
+        &value,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn write_udp_decision_sequence_locked(
+    bpf: &Ebpf,
+    value: &UdpDecisionSequence,
+) -> anyhow::Result<()> {
+    update_locked_udp_decision_sequence(
+        map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?,
+        value,
+    )
 }
 
 pub fn bpf_lookup_and_delete<K: Pod, V: Pod>(
@@ -202,8 +344,13 @@ pub fn bpf_lookup_batch_scan<K: Pod, V: Pod>(
             }
         };
         append_initialized(&keys, &values, count, out);
-        if terminal || count < BPF_BATCH_CHUNK {
+        // A successful batch may be short; only ENOENT marks the final batch.
+        if terminal {
             return Ok(true);
+        }
+        if count == 0 {
+            out.truncate(initial_len);
+            anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
         }
         previous_key = Some(unsafe { next_key.assume_init() });
     }
@@ -250,8 +397,12 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
         if !chunk.is_empty() && !visit(&chunk) {
             return Ok(true);
         }
-        if terminal || count < BPF_BATCH_CHUNK {
+        // A successful batch may be short; only ENOENT marks the final batch.
+        if terminal {
             return Ok(true);
+        }
+        if count == 0 {
+            anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
         }
         previous_key = Some(unsafe { next_key.assume_init() });
     }
@@ -337,6 +488,62 @@ pub fn bpf_update_batch<K: Pod, V: Pod>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_sequence_value_stays_compatible_with_rollback_allocator_across_generation_boundary() {
+        let mut sequence = UdpDecisionSequence {
+            next: udp_decision_token(1, 42).unwrap(),
+            ..UdpDecisionSequence::default()
+        };
+        validate_udp_decision_sequence_value(sequence).unwrap();
+
+        assert_eq!(sequence.exhausted, 0);
+        sequence.next += 1;
+        assert_eq!(sequence.next, udp_decision_token(1, 43).unwrap());
+
+        sequence.next = udp_decision_token(0, UDP_DECISION_SEQUENCE_MASK).unwrap();
+        validate_udp_decision_sequence_value(sequence).unwrap();
+        sequence.next += 1;
+        assert_eq!(sequence.next, 1 << UDP_DECISION_GENERATION_SHIFT);
+        sequence.next += 1;
+        assert_eq!(sequence.next, udp_decision_token(1, 1).unwrap());
+
+        let exhausted = UdpDecisionSequence {
+            next: NFQUEUE_TOKEN_MASK,
+            exhausted: 1,
+            ..UdpDecisionSequence::default()
+        };
+        validate_udp_decision_sequence_value(exhausted).unwrap();
+    }
+
+    #[test]
+    fn malformed_sequence_values_are_rejected() {
+        for malformed in [
+            UdpDecisionSequence {
+                next: NFQUEUE_TOKEN_MASK + 1,
+                ..UdpDecisionSequence::default()
+            },
+            UdpDecisionSequence {
+                exhausted: 2,
+                ..UdpDecisionSequence::default()
+            },
+            UdpDecisionSequence {
+                next: UDP_DECISION_SEQUENCE_MASK,
+                exhausted: 1,
+                ..UdpDecisionSequence::default()
+            },
+        ] {
+            assert!(validate_udp_decision_sequence_value(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn successful_short_batch_is_not_terminal() {
+        for count in [1, BPF_BATCH_CHUNK as u32 - 1] {
+            let (returned, terminal) = lookup_batch_result(Ok(()), count).unwrap();
+            assert!(!terminal);
+            assert_eq!(returned, count as usize);
+        }
+    }
 
     #[test]
     fn terminal_enoent_preserves_partial_count() {
@@ -345,5 +552,35 @@ mod tests {
             assert!(terminal);
             assert_eq!(returned, (count as usize).min(BPF_BATCH_CHUNK));
         }
+    }
+
+    fn compatible_sequence_info() -> bpf_map_info {
+        let mut info: bpf_map_info = unsafe { core::mem::zeroed() };
+        info.type_ = bpf_map_type::BPF_MAP_TYPE_ARRAY as u32;
+        info.key_size = core::mem::size_of::<u32>() as u32;
+        info.value_size = core::mem::size_of::<UdpDecisionSequence>() as u32;
+        info.max_entries = 1;
+        info.btf_id = 1;
+        info.btf_value_type_id = 2;
+        info
+    }
+
+    #[test]
+    fn persistent_sequence_shape_must_match_exactly() {
+        let info = compatible_sequence_info();
+        validate_udp_decision_sequence_info(&info).unwrap();
+
+        let mut wrong = info;
+        wrong.value_size += 4;
+        assert!(validate_udp_decision_sequence_info(&wrong).is_err());
+        let mut wrong = info;
+        wrong.max_entries = 2;
+        assert!(validate_udp_decision_sequence_info(&wrong).is_err());
+        let mut wrong = info;
+        wrong.map_flags = 1;
+        assert!(validate_udp_decision_sequence_info(&wrong).is_err());
+        let mut wrong = info;
+        wrong.btf_value_type_id = 0;
+        assert!(validate_udp_decision_sequence_info(&wrong).is_err());
     }
 }

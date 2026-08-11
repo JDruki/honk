@@ -45,9 +45,9 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | — | `connect_timeout_ms` | `3000` | TCP connect timeout; not settable in dae syntax |
 | — | `dns_resolve_timeout_ms` | `2000` | Control-plane resolve timeout; not settable in dae syntax |
 | — | `relay_idle_timeout_secs` | `300` | Idle relay kill; `0` = off; not settable in dae syntax |
-| `preconnect_node_count` | `preconnect_node_count` | `'auto'` | One startup bare-TCP preconnect pass. `'auto'` tries up to 8 nodes; `0` disables; explicit `N` can cover every eligible node with at most 8 concurrent attempts. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS/QUIC and built-in `direct`/`block` are skipped). |
-| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled. A positive N takes each group's top `min(N,3)` latency-ranked UDP leaves; its independent coordinator runs immediately, then one `check_interval` after each completed batch, with at most four concurrent attempts. The process-wide retained set is re-ranked and capped at `4×N`. |
-| `max_concurrent_dials` | `max_concurrent_dials` | `64` | Generation-local cap on physical proxied connects and protocol handshakes, clamped to an immutable process-wide startup descriptor gate shared by overlapping reload generations. Ready-pool hits and logical streams on already-warm AnyTLS/QUIC transports bypass it; built-in `direct`/`block` dials are also exempt. A changed limit applies to the replacement generation immediately; old-generation in-flight permits continue consuming the same process gate until they finish. |
+| `preconnect_node_count` | `preconnect_node_count` | `'auto'` | One startup bare-TCP preconnect pass. `'auto'` tries up to 8 nodes; `0` disables; explicit `N` can cover every eligible node with at most 8 concurrent attempts. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS, VLESS H2MUX/Mux.Cool, QUIC, and built-in `direct`/`block` are skipped). |
+| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled. A positive N takes each group's top `min(N,3)` latency-ranked UDP leaves; its independent coordinator runs immediately, then one `check_interval` after each completed batch, with at most four concurrent attempts. Reusable VLESS H2MUX/Mux.Cool state participates. The process-wide retained set is re-ranked and capped at `4×N`. |
+| `max_concurrent_dials` | `max_concurrent_dials` | `64` | Generation-local cap on physical proxied connects and protocol handshakes, clamped to an immutable process-wide startup descriptor gate shared by overlapping reload generations. Ready-pool hits and logical streams on already-warm AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/QUIC transports bypass it; built-in `direct`/`block` dials are also exempt. A changed limit applies to the replacement generation immediately; old-generation in-flight permits continue consuming the same process-wide gate until they finish. |
 
 ```dae
 global {
@@ -101,14 +101,15 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 
 | Field | Type | Default | Meaning |
 | ------- | ------ | --------- | --------- |
-| `id` | UUID | content-derived | Stable identity: UUID v5 over `protocol\|host\|port\|credential\|dial-shape` (dial shape = sni/transport/ws/grpc/obfs plus the REALITY/flow handshake shape); renames keep it, two nodes deriving the same ID are rejected (subscription duplicates are skipped with a warning) |
+| `id` | UUID | content-derived | Stable identity: UUID v5 over `protocol\|host\|port\|credential\|dial-shape` (dial shape = sni/transport/ws/grpc/obfs plus the REALITY/flow handshake shape and any non-legacy VLESS mode); renames keep it, two nodes deriving the same ID are rejected (subscription duplicates are skipped with a warning) |
 | `name` | string | **required** | Routing / API name |
 | `protocol` | enum | `ss` | See protocol table |
 | `address` | string | required* | Host or `host:port` |
 | `host` | string | `""` | Explicit host; else from `address` |
 | `port` | u16 | `0` | Server port |
 | `username` / `password` | string? | null | Auth / UUID / secret |
-| `encryption` | string? | null | SS/VMess cipher |
+| `encryption` | string? | null | SS/VMess cipher or Xray VLESS Encryption client string (share-link `encryption=`) |
+| `vless_mode` | `WireMode` | `legacy` | `legacy` / `uot-v2` / `h2mux` / `h2mux-padded` / `xudp` / `mux-cool`; share-link `vless_mode=` |
 | `plugin` / `plugin_opts` | string? | null | Plugin name/opts |
 | `transport` | string | `"tcp"` | `tcp` / `ws` / `grpc` / … (share-link `type=`/`net`) |
 | `tls` | bool | `false` | Enable TLS |
@@ -120,7 +121,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `reality_public_key` | string? | null | REALITY server X25519 public key (share-link `pbk`); when set the node takes the REALITY handshake instead of plain TLS (`security=reality` implies `tls=true`) |
 | `reality_short_id` | string? | null | REALITY short id (share-link `sid`, even-length hex ≤ 8 bytes) |
 | `reality_spider_x` | string? | null | REALITY spider path (share-link `spx`, share-link default `/`) |
-| `flow` | string? | null | VLESS flow control (share-link `flow=`); only `xtls-rprx-vision` is supported and it requires TLS or REALITY — enforced by `Config::validate` |
+| `flow` | string? | null | VLESS flow control (share-link `flow=`); only `xtls-rprx-vision` is supported, it requires TLS or REALITY, and among non-legacy modes only `xudp` may use it — enforced by `Config::validate` |
 | `network` | string? | null | V2Ray-style network hint |
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
@@ -151,7 +152,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `ss` | `shadowsocks` | Yes | Yes | AEAD + `2022-blake3-*` |
 | `trojan` | | Yes | Yes | TLS; WS/gRPC via transport |
 | `vmess` | | Yes | No | AEAD; WS/gRPC; REALITY via `security=reality`; registered only with the `rprx` feature (on in honk-core's default build) |
-| `vless` | | Yes | No | REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; registered only with the `rprx` feature |
+| `vless` | | Yes | Mode-dependent | Xray VLESS Encryption; REALITY + `xtls-rprx-vision`; UoT v2, sing-box H2MUX, Xray Single XUDP, or pooled Mux.Cool UDP; WS/gRPC via transport; registered only with the `rprx` feature |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
@@ -182,12 +183,50 @@ node {
 
 Verified VLESS combinations (live interop against a sing-box 1.13 server): TCP+REALITY+vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, TCP+gRPC. The `xtls-rprx-vision` flow only combines with TCP+REALITY/TLS — over WS/gRPC there is no raw socket for the XTLS direct-copy switch, matching upstream.
 
-Clash subscriptions map VLESS `uuid`, `servername`/`sni`, `flow`, `network`,
+Clash subscriptions map VLESS `uuid`, `encryption`, `servername`/`sni`, `flow`, `network`,
 nested `reality-opts`, `ws-opts`, and `grpc-opts` into the same node fields
 before identity derivation. Incomplete `reality-opts` entries are skipped.
 Feed shapes outside TCP/WS/gRPC, non-Vision flows, Vision without TLS/REALITY,
 and Vision over WS/gRPC are reported by `honk-tool sub` but not probed.
 `client-fingerprint` is not a node field; the global TLS mode owns it.
+
+#### VLESS modes
+
+`Node.vless_mode` is one normalized `WireMode`; it is explicit, mutually exclusive, and never negotiated:
+
+| Value | TCP | UDP | Behavior |
+| ------- | ----- | ----- | -------- |
+| `legacy` | Existing VLESS stream | No | Backward-compatible default; legacy node IDs are unchanged |
+| `uot-v2` | Existing VLESS stream | Direct UoT v2 | One connected UoT stream per UDP transport; no multiplexing layer |
+| `h2mux` | H2MUX logical stream | Native sing-mux connected UDP | TCP and UDP share a node-owned HTTP/2 carrier pool |
+| `h2mux-padded` | H2MUX logical stream | Native sing-mux connected UDP | `h2mux` plus sing-mux v1 padding |
+| `xudp` | Existing VLESS stream | Single XUDP | One VLESS mux-command carrier per UDP transport, using XUDP session id 0; TCP stays on the ordinary path |
+| `mux-cool` | Mux.Cool logical stream | Pooled XUDP | Logical TCP and UDP share a node-owned Xray Mux.Cool carrier pool |
+
+Canonical dae configuration stays inside the VLESS share link:
+
+```dae
+node {
+    vless_mux: 'vless://uuid@example.com:443?security=tls&vless_mode=h2mux#vless_mux'
+    vless_xudp: 'vless://uuid@example.com:443?security=reality&pbk=...&sid=ab12&vless_mode=mux-cool#vless_xudp'
+}
+```
+
+H2MUX and Mux.Cool each cap reusable or dialing carriers at two per node and each carrier at 128 logical streams. H2MUX preserves HTTP/2 flow control, half-close/reset, GOAWAY rollover, and optional v1 padding. Mux.Cool serializes all child frames through one ordered writer, never reuses session IDs, supports full-cone UDP reply sources, and rolls over after 128 issued IDs. A draining carrier no longer consumes this cap: GOAWAY or ID exhaustion can dial a replacement while its live children finish, then the old carrier closes. Both pools survive unchanged-node reloads and drain reusable state without cutting active children. Single XUDP is deliberately unpooled. Saturation of two active carriers waits; a speculative loser never publishes; no mode probes, falls back, or replays a first packet.
+
+Every non-legacy mode rejects non-`none` VLESS Encryption. `flow=xtls-rprx-vision` is valid only with `legacy` or `xudp`; the other modes own incompatible inner framing. Canonical share links use `vless_mode`; legacy `packetEncoding=xudp` imports as `xudp`, while ambiguous `smux`, `multiplex`, `udp-over-tcp`, `packet-encoding`, `packet-addr`, and `xudp` query parameters are rejected. Clash/mihomo YAML imports enabled `smux`/`multiplex` as H2MUX when `protocol: h2mux` or an explicit `padding` boolean disambiguates the wire mode; an enabled block missing both is rejected. It maps `udp-over-tcp` version 0/2 to UoT v2 and `packet-encoding: xudp` or `xudp: true` to Single XUDP; conflicting representations, packetaddr, unsupported mux protocols/tuning, or `udp: true` without an explicit packet mode are rejected. `mux-cool` currently requires the canonical share-link mode. Official live interop covers sing-box UoT/H2MUX and Xray Single XUDP/Mux.Cool, including TLS, REALITY, padding, and XUDP Vision.
+
+**VLESS Encryption**
+
+Set the share-link `encryption=` query parameter (or the structured `Node.encryption` field) to the client string produced by `xray vlessenc`:
+
+```dae
+node {
+    vless_e: 'vless://uuid@example.com:443?security=none&encryption=mlkem768x25519plus.native.0rtt.<base64url-public-key>#vless_e'
+}
+```
+
+The client supports Xray's `native`, `xorpub`, and `random` wire modes; X25519 or ML-KEM-768 authentication keys (including chained keys); per-connection ML-KEM-768 + X25519 forward secrecy; and `1rtt` or cached-ticket `0rtt`. Payload records use AES-256-GCM when hardware acceleration is available and ChaCha20-Poly1305 otherwise. VLESS Encryption runs inside the selected TCP/TLS/REALITY/WS/gRPC transport, but cannot be combined with `xtls-rprx-vision`. Raw-TCP interoperability is verified against Xray 26.7.28 for all three modes, both authentication key types, chained X25519 keys, and the 1-RTT → 0-RTT transition.
 
 **VLESS + REALITY (xtls-rprx-vision)**
 
@@ -249,7 +288,7 @@ node {
 | -------- | ------- |
 | `ss://` | SIP002 |
 | `vmess://` | base64 JSON (v2rayN) |
-| `vless://` / `trojan://` | query params for transport/TLS; vless/vmess also take `security=reality|tls|none`, `pbk`, `sid`, `spx`, `flow` (REALITY + xtls-rprx-vision) |
+| `vless://` / `trojan://` | query params for transport/TLS; vless/vmess also take `security=reality|tls|none`, `pbk`, `sid`, `spx`, `flow`, while VLESS alone takes canonical `vless_mode=` |
 | `anytls://` | pool params in query |
 | `hysteria2://` / `tuic://` / `juicity://` | QUIC family |
 | `socks5://` | simple |
@@ -299,7 +338,7 @@ group {
 
 | Canonical | dae spellings | Behavior |
 | ----------- | ------------- | ---------- |
-| `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache. Its configured leaf is always warm: reusable AnyTLS/QUIC state or one bare server TCP for other proxy protocols. |
+| `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache. Its configured leaf is always warm: a reusable AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool session, a QUIC client, or one bare server TCP for other proxy protocols. |
 | `urltest` | `min_moving_avg`, `min_avg10`, `min_last_delay` | Lowest latency + tolerance; ranks by a halving moving average `(prev+sample)/2` (dae `min_moving_avg` semantics); **TCP/UDP separate** |
 | `loadbalance` | `roundrobin`, `round_robin`, `balance` | Per-group, per-network RR among alive members |
 | `fallback` | `fallback` | First alive sticky per TCP/UDP network; no instant failback |
@@ -624,8 +663,51 @@ experimental {
         store_fakeip: false
         store_dns: false
     }
+    udp_nfqueue {
+        enabled: false
+    }
 }
 ```
+
+### `experimental { udp_nfqueue { ... } }`
+
+| Field | Default | Meaning |
+| ------- | --------- | --------- |
+| `enabled` | `false` | Hold ambiguous LAN-forwarded UDP first packets in NFQUEUE for a final userspace decision |
+
+This field is restart-required. When it is `true`, startup accepts only a build
+with the `ebpf` feature using the real eBPF backend; `--mock-ebpf` and builds
+without `ebpf` are rejected. The hook covers LAN-forwarded traffic because host
+`inet prerouting` follows LAN TC. Host-originated WAN egress stays on the
+canonical TPROXY path. DNS port 53, internal/special traffic, `must`, `block`,
+reverse traffic, and already-safe direct decisions are never queued; only
+ambiguous userspace/domain decisions are staged.
+
+The mechanism is fixed: raw-netlink queue `320`, one listener feeding one bounded
+ingest actor, and no bypass, fanout, fail-open, or user-selectable queue/worker
+policy. honk exclusively owns the exact nftables names `inet honk_nfqueue` /
+`udp_decision`; firewall managers in the same network namespace must not mutate
+them while honk runs. The pinned `UDP_DECISION_SEQUENCE` allocator survives
+ordinary restart/cleanup. Its rollback-compatible 12-byte value keeps the full
+raw token in `next`; startup validates it without rewriting it, so an older
+binary resumes at the same token boundary. Tokens still divide that raw value
+into a two-bit generation and 28-bit sequence. At sequence exhaustion, honk
+fences new staging, drains held packets and deferred token cleanups, hard-rebinds
+the queue, and switches only when the candidate generation and every higher
+generation through 3 are absent from all live token-bound maps. A rolled-back
+legacy allocator can advance only through that range. If no such candidate is
+clear, staging stays fenced and the supervisor retries; non-staged UDP continues
+while ambiguous new flows fail closed. No reboot is required.
+
+Held skbs are before conntrack/NAT. A final direct decision uses a token-checked
+Arm → FIFO accept with the final mark → Activate transition and creates no
+userspace direct socket, payload copy, deliberate retransmission, endpoint, or
+connection entry. Proxy first commits its token-bound state, moves the one
+retained payload copy into the canonical UDP initializer, drops the originals,
+then dials/sends exactly once. Block/cancel drop. Reload and shutdown fence
+readiness and quiesce/cancel all guards before queue/table teardown.
+Queue/listener/verdict failures remain fatal; allocator exhaustion is recovered
+by the fenced generation rotation above.
 
 ### `experimental { clash_api { ... } }`
 
@@ -677,7 +759,15 @@ udp = {
   queue: { accepted, full, closed },
   firstSend: { failures },
   stagger: { attempts, winners, cancellations },
-  warm: { attempts, successes, failures }
+  warm: { attempts, successes, failures },
+  nfqueue: {
+    received, activeFlows, kernelQueueDepth, kernelStatsAvailable,
+    kernelStatsReadErrors, kernelDropped, kernelUserDropped, heldPackets,
+    heldPeak, socketReceiveBufferBytes, actorQueueFull, correlatorFull,
+    actorQueueDepth, actorQueuedBytes, actorOldestAgeNanos, directAccepted,
+    proxyCopied, proxyDropped, block, cancel, drop, tokenMismatch,
+    tokenExhaustion, tokenRollovers, verdictErrors, receiptToVerdict: H
+  }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 ```
@@ -691,20 +781,42 @@ publication. If ordinary traffic already filled a QUIC generation slot, that inc
 remains and the winning transport owns its connection only for the selected flow. Warm
 `successes` count `Ready`; a `NotApplicable` result is neutral.
 
+`nfqueue.received` counts listener deliveries and `activeFlows` is the current
+pending-correlator gauge. A one-second task samples the owned kernel queue
+independently of packet dispatch. `kernelStatsAvailable` says whether the latest
+read succeeded; `kernelStatsReadErrors` is cumulative. On failure, the last
+`kernelQueueDepth`, `kernelDropped`, and `kernelUserDropped` values remain visible
+rather than becoming ambiguous zeroes, while the local `heldPackets`, `heldPeak`,
+and `socketReceiveBufferBytes` gauges continue to refresh. `kernelDropped` and
+`kernelUserDropped` are process-lifetime counters accumulated across queue hard
+rebinds; `kernelQueueDepth` remains the current-instance gauge. `heldPackets` and
+`heldPeak` count dispatched verdict guards. `socketReceiveBufferBytes` is the
+effective netlink receive buffer. `actorQueueFull` counts fail-closed ingest-actor
+admission drops. `correlatorFull` counts packets dropped at the hard limit of
+4,096 concurrent flow cells or 64 held verdicts per flow. `actorQueueDepth`,
+`actorQueuedBytes`, and `actorOldestAgeNanos` expose current ingest pressure.
+`directAccepted`, `proxyDropped`, `block`, `cancel`, and `drop` count successful
+kernel verdicts; `proxyCopied` counts the single payload
+ownership transfer into the canonical initializer. `tokenMismatch`,
+`tokenExhaustion`, `tokenRollovers`, and `verdictErrors` expose token and verdict
+events. `receiptToVerdict` measures listener receipt to successful verdict and
+is not labelled as kernel queue residence because NFQA timestamps are not
+guaranteed.
+
 `/stats` also carries a top-level `warm` object of point-in-time gauges:
 
 ```text
 warm = {
   nodes: { preconnect, health, udp, selector, traffic },
-  sessions: { anytls, tuic, juicity, hysteria2 }
+  sessions: { anytls, vless, tuic, juicity, hysteria2 }
 }
 ```
 
 `nodes` counts currently warm nodes by the reason retaining their resources
 (a node may count under several reasons; a warm node with no recorded reason
 counts as `traffic`). `selector` is the always-on pin for configured Selector
-leaves. `sessions` counts retained AnyTLS pool sessions and occupied QUIC
-client slots per protocol. Gauges track the live generation: a node whose
+leaves. `sessions` counts retained AnyTLS/VLESS pool sessions and occupied
+QUIC client slots per protocol. Gauges track the live generation: a node whose
 resources drain drops out of the next snapshot.
 
 Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
