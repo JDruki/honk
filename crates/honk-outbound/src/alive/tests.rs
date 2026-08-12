@@ -108,10 +108,13 @@ fn test_merge_check_addrs_dedup() {
 fn test_alive_set_basic() {
     let set = AliveDialerSet::new();
     assert!(set.is_alive(id(1)));
-    // TCP probe threshold = 1 (Go: immediate death on probe failure):
-    // the first failure already marks the node dead.
+    // TCP probe threshold = 3: one transient failure must not kill the
+    // node; three consecutive failures do.
     set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
-    assert!(!set.is_alive(id(1)), "TCP should die after 1 probe failure");
+    assert!(set.is_alive(id(1)), "TCP survives one probe failure");
+    set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
+    set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
+    assert!(!set.is_alive(id(1)), "TCP dies after 3 probe failures");
     // DNS UDP probe threshold = 3 — verify per-protocol thresholds
     assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
     set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
@@ -353,8 +356,10 @@ fn test_push_ebpf_uses_outbound_resolver() {
         calls2.lock().unwrap().push((o, d, ip, alive));
     }));
 
-    // No resolver installed → legacy outbound 0.
-    set.mark_dead(id(1)); // Tcp×V4+V6
+    // No resolver installed → legacy outbound 0. TCP dies at 3 failures.
+    for _ in 0..3 {
+        set.mark_dead(id(1)); // Tcp×V4+V6
+    }
     assert_eq!(
         calls.lock().unwrap().as_slice(),
         &[(0u8, 0u32, 0u32, false), (0u8, 0u32, 1u32, false)]
@@ -366,8 +371,10 @@ fn test_push_ebpf_uses_outbound_resolver() {
             if node == id(2) { Some(5u8) } else { None }
         },
     )));
-    set.mark_dead(id(2));
-    set.mark_dead(id(3));
+    for _ in 0..3 {
+        set.mark_dead(id(2));
+        set.mark_dead(id(3));
+    }
     assert_eq!(
         calls.lock().unwrap().as_slice(),
         &[
@@ -376,26 +383,6 @@ fn test_push_ebpf_uses_outbound_resolver() {
             (5u8, 0u32, 0u32, false),
             (5u8, 0u32, 1u32, false),
         ]
-    );
-}
-
-#[test]
-fn test_clear_latency() {
-    let set = AliveDialerSet::new();
-    set.record_probe_latency(
-        id(1),
-        ProbeDomain::Tcp,
-        IpVersion::V4,
-        Duration::from_millis(42),
-    );
-    assert_eq!(
-        set.get_last_latency(id(1), ProbeDomain::Tcp, IpVersion::V4),
-        Some(Duration::from_millis(42))
-    );
-    set.clear_latency(id(1));
-    assert_eq!(
-        set.get_last_latency(id(1), ProbeDomain::Tcp, IpVersion::V4),
-        None
     );
 }
 
@@ -662,8 +649,14 @@ fn test_death_callback_fires_on_flip_only() {
         calls2.lock().unwrap().push(node);
     })));
 
-    // Unregistered → outside grace; TCP probe threshold is 1. mark_dead
+    // Unregistered → outside grace; TCP probe threshold is 3. mark_dead
     // covers both IP versions → one call per flipped (domain, ipver).
+    set.mark_dead(id(1));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "no flip before the threshold"
+    );
+    set.mark_dead(id(1));
     set.mark_dead(id(1));
     assert_eq!(calls.lock().unwrap().len(), 2);
 
@@ -719,7 +712,13 @@ fn test_url_probe_state_independence() {
         Some(Duration::from_millis(40))
     );
 
-    // One failure kills (TCP-probe parity) — for url_a only.
+    // Three consecutive failures kill (TCP-probe parity) — for url_a only.
+    set.record_url_probe_failure("n1", url_a);
+    assert!(
+        set.is_alive_for_url("n1", url_a),
+        "one failure is not death"
+    );
+    set.record_url_probe_failure("n1", url_a);
     set.record_url_probe_failure("n1", url_a);
     assert!(!set.is_alive_for_url("n1", url_a));
     assert!(set.is_alive_for_url("n1", url_b), "other URL unaffected");
@@ -803,4 +802,113 @@ async fn test_direct_probe_uses_direct_check_addr() {
         )
         .await
     );
+}
+
+/// Failure demotion is sticky: a dial failure adds a strike that only
+/// max(strikes, 2) consecutive real probe successes clear — one lucky
+/// success never re-ranks a flaky node.
+#[test]
+fn test_failure_demotion_needs_consecutive_successes() {
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    let probe_ok = |ms: u64| {
+        set.record_probe_latency(
+            node,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        );
+    };
+    let demoted = || set.is_failure_demoted(node, ProbeDomain::Tcp, IpVersion::V4);
+
+    probe_ok(10);
+    assert!(!demoted());
+
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(demoted());
+    probe_ok(10);
+    assert!(demoted(), "one success must not clear the strike");
+    probe_ok(10);
+    assert!(!demoted(), "two consecutive successes clear it");
+
+    // A fresh failure resets the clear progress: the success between the
+    // two failures no longer counts toward the clear.
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    probe_ok(10);
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    probe_ok(10);
+    assert!(demoted(), "progress was reset by the second failure");
+    probe_ok(10);
+    assert!(!demoted());
+}
+
+/// Real-traffic fast path: three consecutive dials far above the node's own
+/// EMA demote it (synthetic strike + emergency-probe signal); mixed
+/// fast/slow sequences never do.
+#[test]
+fn test_report_dial_latency_demotes_after_three_slow_dials() {
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    let report = |ms: u64| {
+        set.report_dial_latency(
+            node,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        )
+    };
+
+    // Warmup: the EMA learns ~100ms without judging.
+    assert!(!report(100));
+    assert!(!report(100));
+    assert!(!report(100));
+
+    // 400ms > min(2×100, 100+500) = 200ms → slow; two in a row are not
+    // enough, the third consecutive one demotes.
+    assert!(!report(400));
+    assert!(!report(400));
+    assert!(report(400), "third consecutive slow dial demotes");
+    assert!(set.is_failure_demoted(node, ProbeDomain::Tcp, IpVersion::V4));
+
+    // Streak resets on any fast dial: slow,slow,fast,slow,slow never
+    // reaches three consecutive.
+    let node2 = id(2);
+    let report2 = |ms: u64| {
+        set.report_dial_latency(
+            node2,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        )
+    };
+    report2(100);
+    report2(100);
+    report2(100);
+    assert!(!report2(400));
+    assert!(!report2(400));
+    assert!(!report2(100), "fast dial resets the streak");
+    assert!(!report2(400));
+    assert!(!report2(400));
+    assert!(!set.is_failure_demoted(node2, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// Built-in direct/block nodes are exempt: local-egress latency is not
+/// node quality.
+#[test]
+fn test_report_dial_latency_ignores_builtin_nodes() {
+    let set = AliveDialerSet::new();
+    for _ in 0..6 {
+        assert!(!set.report_dial_latency(
+            DIRECT_NODE_ID,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_secs(9),
+        ));
+        assert!(!set.report_dial_latency(
+            BLOCK_NODE_ID,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_secs(9),
+        ));
+    }
 }

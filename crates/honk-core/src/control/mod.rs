@@ -221,6 +221,11 @@ impl NfqueueRuntime {
         &mut self,
         ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
     ) -> NfqueueRuntimeEvent {
+        enum ExitedTask {
+            Watchdog(Result<(), tokio::task::JoinError>),
+            IngestActor(Result<(), tokio::task::JoinError>),
+            StatsSampler(Result<(), tokio::task::JoinError>),
+        }
         loop {
             let listener_fatal = &mut self.listener_fatal;
             let pending_fatal = &mut self.pending_fatal;
@@ -237,7 +242,7 @@ impl NfqueueRuntime {
                 .ingest_worker
                 .as_mut()
                 .expect("NFQUEUE ingest actor is retained until shutdown");
-            tokio::select! {
+            let exited = tokio::select! {
                 result = listener_fatal => {
                     return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(match result {
                         Ok(error) => NfqueueRuntimeFatal::Listener(error),
@@ -251,43 +256,49 @@ impl NfqueueRuntime {
                             .unwrap_or(NfqueueRuntimeFatal::PendingChannelClosed),
                     ));
                 }
-                result = watchdog => {
-                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                result = watchdog => Some(ExitedTask::Watchdog(result)),
+                result = ingest_worker => Some(ExitedTask::IngestActor(result)),
+                result = stats_sampler => Some(ExitedTask::StatsSampler(result)),
+                _ = token_backstop.tick() => None,
+            };
+            // A resolved JoinHandle panics if awaited again; drop it so the
+            // shutdown path skips the already-consumed task.
+            if let Some(exited) = exited {
+                let fatal = match exited {
+                    ExitedTask::Watchdog(result) => {
+                        self.watchdog.take();
                         NfqueueRuntimeFatal::Watchdog(match result {
                             Ok(()) => "completed".to_string(),
                             Err(error) => error.to_string(),
-                        }),
-                    ));
-                }
-                result = ingest_worker => {
-                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        })
+                    }
+                    ExitedTask::IngestActor(result) => {
+                        self.ingest_worker.take();
                         NfqueueRuntimeFatal::IngestActor(match result {
                             Ok(()) => "completed".to_string(),
                             Err(error) => error.to_string(),
-                        }),
-                    ));
-                }
-                result = stats_sampler => {
-                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        })
+                    }
+                    ExitedTask::StatsSampler(result) => {
+                        self.stats_sampler.take();
                         NfqueueRuntimeFatal::StatsSampler(match result {
                             Ok(()) => "completed".to_string(),
                             Err(error) => error.to_string(),
-                        }),
-                    ));
-                }
-                _ = token_backstop.tick() => {
-                    match ebpf.read().await.udp_decision_sequence_status() {
-                        Ok(status) if status.exhausted() => {
-                            self.stats.record_udp_nfqueue_token_exhaustion();
-                            return NfqueueRuntimeEvent::TokenExhausted;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
-                                NfqueueRuntimeFatal::TokenBackstop(error.to_string()),
-                            ));
-                        }
+                        })
                     }
+                };
+                return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(fatal));
+            }
+            match ebpf.read().await.udp_decision_sequence_status() {
+                Ok(status) if status.exhausted() => {
+                    self.stats.record_udp_nfqueue_token_exhaustion();
+                    return NfqueueRuntimeEvent::TokenExhausted;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        NfqueueRuntimeFatal::TokenBackstop(error.to_string()),
+                    ));
                 }
             }
         }
@@ -1767,12 +1778,9 @@ impl ControlPlane {
             let group_manager_for_push = self.group_manager.clone();
             let config_for_push = self.config.clone();
             alive_set.set_ebpf_callback(Box::new(move |outbound_idx, domain, ipver, _alive| {
-                // The eBPF connectivity slot is shared by every node in the
-                // group, so never write the transitioning node's own state:
-                // one dead member would silently TC_ACT_SHOT the whole
-                // group's new flows in the kernel datapath. Write the OR of
-                // member states instead — the group is "alive" in eBPF iff
-                // at least one member is alive for this domain/ipver.
+                // Group slots normally publish the OR of their leaf health.
+                // A sole TCP leaf without `final` stays open so userspace can
+                // make the one real dial capable of proving recovery.
                 let probe_domain = match domain {
                     1 => ProbeDomain::DnsUdp,
                     2 => ProbeDomain::DataUdp,
@@ -1784,20 +1792,21 @@ impl ControlPlane {
                     IpVersion::V4
                 };
                 // Group ids are OutboundIndex::UserBase + group index.
-                let group_name = config_for_push.try_read().ok().and_then(|c| {
+                let group = config_for_push.try_read().ok().and_then(|c| {
                     let idx = outbound_idx
                         .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)?;
-                    c.groups.get(idx as usize).map(|g| g.name.clone())
+                    c.groups.get(idx as usize).cloned()
                 });
-                let any_alive = match group_name {
-                    Some(name) => {
+                let any_alive = match group {
+                    Some(group) => {
                         let gm = group_manager_for_push.read().clone();
-                        // Leaf expansion matters here: member tags may name
-                        // nested sub-groups, which have no alive state of
-                        // their own — only real leaf nodes carry health.
-                        gm.leaf_nodes_in_group(&name)
-                            .iter()
-                            .any(|n| alive_for_push.is_alive_for(n.id, probe_domain, ip_version))
+                        reload::group_datapath_alive(
+                            &group,
+                            &gm,
+                            &alive_for_push,
+                            probe_domain,
+                            ip_version,
+                        )
                     }
                     // Unknown outbound: keep the datapath open (userspace
                     // makes the final decision anyway).

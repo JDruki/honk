@@ -368,10 +368,11 @@ pub async fn urltest_group(
     results
 }
 
-/// Empty or plain-HTTP URLs fall back to the default HTTPS liveness URL.
+/// Empty URLs fall back to the default HTTPS liveness URL; an explicit
+/// URL (http or https) is always honored as given.
 fn normalize_url(url: &str) -> &str {
     let url = url.trim();
-    if url.is_empty() || url.starts_with("http://") {
+    if url.is_empty() {
         DEFAULT_URLTEST_URL
     } else {
         url
@@ -432,10 +433,18 @@ mod resolver_hook_tests {
         set_urltest_resolver(std::sync::Arc::new(move |host, port| {
             let called2 = called2.clone();
             Box::pin(async move {
-                called2.store(true, std::sync::atomic::Ordering::Relaxed);
-                assert_eq!(host, "example.invalid");
-                assert_eq!(port, 443);
-                vec!["127.0.0.1:443".parse().unwrap()]
+                // Other urltest tests run concurrently against this global
+                // hook — answer only our host, pass foreigners through to
+                // the system resolver instead of breaking their dials.
+                if host == "example.invalid" && port == 443 {
+                    called2.store(true, std::sync::atomic::Ordering::Relaxed);
+                    vec!["127.0.0.1:443".parse().unwrap()]
+                } else {
+                    tokio::net::lookup_host(format!("{host}:{port}"))
+                        .await
+                        .map(|addrs| addrs.collect())
+                        .unwrap_or_default()
+                }
             })
         }));
         let node = Node::default();
@@ -654,7 +663,7 @@ mod tests {
         assert_eq!(normalize_url(""), DEFAULT_URLTEST_URL);
         assert_eq!(
             normalize_url("http://www.gstatic.com/generate_204"),
-            DEFAULT_URLTEST_URL
+            "http://www.gstatic.com/generate_204"
         );
         assert_eq!(
             normalize_url("https://example.com/x"),
@@ -738,10 +747,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_urltest_group_clears_latency_on_failure() {
+    async fn test_urltest_group_marks_failure_with_synthetic_sample() {
         // Plaintext HTTP server: every https measurement fails the TLS
-        // handshake, so the group run must clear latency history for both
-        // the dial-failing and the handshake-failing member.
+        // handshake, so the group run must append a synthetic penalty sample
+        // for both the dial-failing and the handshake-failing member.
         let addr = spawn_mock_http_server().await;
         let url = format!("https://{}:{}/", addr.ip(), addr.port());
 
@@ -779,12 +788,19 @@ mod tests {
         assert!(results[0].1.is_err());
         assert!(results[1].1.is_err());
 
-        // Failure → history replaced by the synthetic penalty sample, so the
-        // stale 999ms no longer ranks the node.
+        // Failure → synthetic penalty sample on top of the retained history:
+        // the latest sample is the 10s placeholder (display-only) and a
+        // failure strike demotes the node, while the real 999ms moving
+        // average survives unpoisoned.
         for m in &members {
             assert_eq!(
                 alive_set.get_last_latency(m.id, ProbeDomain::Tcp, IpVersion::V4),
                 Some(Duration::from_secs(10))
+            );
+            assert!(alive_set.is_failure_demoted(m.id, ProbeDomain::Tcp, IpVersion::V4));
+            assert_eq!(
+                alive_set.get_moving_average(m.id, ProbeDomain::Tcp, IpVersion::V4),
+                Some(Duration::from_millis(999))
             );
         }
     }
