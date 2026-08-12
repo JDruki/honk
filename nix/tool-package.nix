@@ -20,7 +20,7 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../Cargo.lock;
     outputHashes = {
-      "boring-sys-5.1.0" = "sha256-CjKtJNqfv7codFiIzushlAQDy/iVqe2EChWRZamsCLQ=";
+      "boring-sys-5.1.0" = "sha256-Tvf9qpUC6IO3ikkHO7BG0lp+ZGtu4DiS0HKKFdmjwjY=";
     };
   };
 
